@@ -5,6 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$repo_root"
 temporary=$(mktemp -d)
 cache_backup=''
+foreign_lock=''
 
 cleanup() {
   chmod +x mvnw 2>/dev/null || true
@@ -12,6 +13,7 @@ cleanup() {
     rm -rf .cache
     mv "$cache_backup" .cache
   fi
+  [[ -z "$foreign_lock" || ! -d "$foreign_lock" ]] || rmdir "$foreign_lock"
   rm -rf "$temporary"
 }
 trap cleanup EXIT
@@ -50,6 +52,19 @@ bash scripts/bootstrap-workspace.sh >/dev/null
 install=.cache/dbeaver-26.1.0/dbeaver
 install_root=.cache/dbeaver-26.1.0
 archive=.cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
+
+foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
+mkdir "$foreign_lock"
+expect_failure foreign-lock-preserved bash scripts/prepare-dbeaver-target.sh
+rg -q 'another DBeaver preparation is active' "$temporary/foreign-lock-preserved.out"
+test -d "$foreign_lock"
+if mkdir "$foreign_lock" 2>/dev/null; then
+  echo 'foreign preparation lock became acquirable' >&2
+  exit 1
+fi
+rmdir "$foreign_lock"
+foreign_lock=''
+echo 'negative guard passed: failed acquisition preserved foreign lock ownership'
 
 printf 'changed\n' >> "$install/dbeaver.ini"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/modified.out"

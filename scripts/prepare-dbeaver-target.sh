@@ -18,6 +18,7 @@ temporary_download=''
 staging_root=''
 backup_root=''
 lock_root=''
+lock_owned=false
 cleanup() {
   status=$?
   if [[ -n "$backup_root" && -e "$backup_root" ]]; then
@@ -26,7 +27,7 @@ cleanup() {
   fi
   [[ -z "$temporary_download" ]] || rm -rf "$temporary_download"
   [[ -z "$staging_root" ]] || rm -rf "$staging_root"
-  [[ -z "$lock_root" ]] || rmdir "$lock_root" 2>/dev/null || true
+  [[ "$lock_owned" != true ]] || rmdir "$lock_root" 2>/dev/null || true
   return "$status"
 }
 trap cleanup EXIT
@@ -135,6 +136,7 @@ mkdir -p "$cache_dir"
 [[ "$(realpath -P "$cache_dir")" == "$cache_dir" ]] || { echo 'download cache escaped workspace' >&2; exit 1; }
 lock_root=$cache_root/.prepare-dbeaver-${version}.lock
 mkdir "$lock_root" || { echo 'another DBeaver preparation is active' >&2; exit 1; }
+lock_owned=true
 if [[ -f "$archive" && "$(sha256 "$archive")" == "$digest" ]]; then
   echo "reusing verified archive: $archive"
 else
