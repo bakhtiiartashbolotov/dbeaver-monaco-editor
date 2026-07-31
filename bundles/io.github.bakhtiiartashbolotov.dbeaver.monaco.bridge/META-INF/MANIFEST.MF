@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: DBeaver Monaco Bridge
+Bundle-SymbolicName: io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge;singleton:=true
+Bundle-Version: 0.1.0.qualifier
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+

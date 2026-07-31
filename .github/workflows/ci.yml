@@ -1,0 +1,49 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  scaffold:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Java 21
+        uses: actions/setup-java@7a445ee88d4e23b52c33c877d4f7b7a6d3db87a8 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Set up Node
+        uses: actions/setup-node@1e60f620b9541d7c243d3452f8c7b1f7b84c8e04 # v4.0.3
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Pin npm
+        run: npm install --global npm@11.16.0
+      - name: Cache verified DBeaver archive
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.2.1
+        with:
+          path: .cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
+          key: dbeaver-26.1.0-${{ hashFiles('releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256') }}
+      - run: bash scripts/verify-layout.sh
+      - run: bash scripts/bootstrap-workspace.sh
+      - run: ./mvnw -B verify
+      - run: bash scripts/verify-test-target.sh repository/target/repository
+      - run: npm --prefix web ci
+      - run: npm --prefix web run lint
+      - run: npm --prefix web test
+      - run: npm --prefix web run build
+      - name: Upload p2 repository and baseline evidence
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: task-1-scaffold
+          path: |
+            repository/target/repository
+            docs/evidence/task-1-baseline.md

@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: DBeaver Monaco Ui
+Bundle-SymbolicName: io.github.bakhtiiartashbolotov.dbeaver.monaco.ui;singleton:=true
+Bundle-Version: 0.1.0.qualifier
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+Require-Bundle: org.jkiss.dbeaver.ui.editors.sql;bundle-version="[1.0.180,2.0.0)"
