@@ -81,6 +81,8 @@ def validated_members(
         else:
             fail(f"unsupported archive entry type {typeflag!r}: {member.name}")
 
+        if kind == "file" and raw.endswith("/"):
+            fail(f"regular file archive path ends in slash: {raw}")
         if (not raw or raw.startswith("/") or raw.startswith("./") or "//" in raw or "\\" in raw
                 or any(part in ("", ".", "..") for part in raw.rstrip("/").split("/"))):
             fail(f"unsafe archive path: {raw}")

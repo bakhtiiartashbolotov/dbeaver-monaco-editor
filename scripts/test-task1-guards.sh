@@ -155,6 +155,9 @@ archive("unsafe-late.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b
                                ("dbeaver/link", "symlink", b"")])
 base = [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a")]
 archive("file-slash.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/", "file", b"a")])
+archive("file-slash-collision.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/", "dir", b""),
+                                           ("dbeaver/a/", "file", b"a")])
+archive("root-file-slash.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/", "file", b"a")])
 archive("root-no-slash.tar.gz", [("dbeaver", "dir", b""), ("dbeaver/a", "file", b"a")])
 archive("hardlink.tar.gz", base + [("dbeaver/hard", "hardlink", b"")])
 archive("special.tar.gz", base + [("dbeaver/fifo", "special", b"")])
@@ -182,7 +185,8 @@ payload[148:156] = f"{sum(payload[:512]):06o}\0 ".encode("ascii")
 with gzip.open(root_alias, "wb") as target:
     target.write(payload)
 PY
-for fixture in duplicate-root missing-root unsafe-late file-slash root-no-slash hardlink special absolute traversal \
+for fixture in duplicate-root missing-root unsafe-late file-slash file-slash-collision root-file-slash \
+  root-no-slash hardlink special absolute traversal \
   duplicate-path contiguous missing-parent file-ancestor-first file-ancestor-last identity-collision; do
   destination=$temporary/$fixture-output
   expect_failure "archive-$fixture" python3 scripts/verify-dbeaver-tree.py --extract \
