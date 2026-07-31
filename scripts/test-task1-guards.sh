@@ -128,8 +128,10 @@ def archive(name, entries):
             info = tarfile.TarInfo(path)
             if kind == "dir":
                 info.type = tarfile.DIRTYPE
+                info.mode = 0o755
                 target.addfile(info)
             elif kind == "file":
+                info.mode = 0o644
                 info.size = len(data)
                 target.addfile(info, io.BytesIO(data))
             elif kind == "symlink":
@@ -200,7 +202,11 @@ test ! -e "$destination"
 destination=$temporary/longlink-valid-output
 python3 scripts/verify-dbeaver-tree.py --extract "$temporary/longlink-valid.tar.gz" "$destination" \
   "$(sha256sum "$temporary/longlink-valid.tar.gz" | cut -d' ' -f1)" >/dev/null
-test "$(cat "$destination/$(printf 'canonical-long-directory-%.0s' {1..5})/$(printf 'canonical-long-file-%.0s' {1..5})")" = long
+long_output_directory=$destination/$(printf 'canonical-long-directory-%.0s' {1..5})
+long_output_file=$long_output_directory/$(printf 'canonical-long-file-%.0s' {1..5})
+test "$(stat -c '%a' "$long_output_directory")" = 755
+test "$(stat -c '%a' "$long_output_file")" = 644
+test "$(cat "$long_output_file")" = long
 echo 'positive guard passed: canonical GNU LongLink directory and file extracted'
 
 cp "$temporary/longlink-valid.tar.gz" "$temporary/snapshot-source.tar.gz"
