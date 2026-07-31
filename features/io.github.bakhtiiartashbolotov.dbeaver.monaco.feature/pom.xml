@@ -9,4 +9,30 @@
   </parent>
   <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.feature</artifactId>
   <packaging>eclipse-feature</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.core</artifactId>
+      <version>${revision}</version>
+      <type>eclipse-plugin</type>
+    </dependency>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge</artifactId>
+      <version>${revision}</version>
+      <type>eclipse-plugin</type>
+    </dependency>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.web</artifactId>
+      <version>${revision}</version>
+      <type>eclipse-plugin</type>
+    </dependency>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.ui</artifactId>
+      <version>${revision}</version>
+      <type>eclipse-plugin</type>
+    </dependency>
+  </dependencies>
 </project>

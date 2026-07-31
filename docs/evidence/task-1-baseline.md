@@ -44,30 +44,42 @@ All routes below use Eclipse commands and the public `IHandlerService` (`canExec
 
 ## Native formatting compatibility finding
 
-The pinned product contains the mutating command
-`org.jkiss.dbeaver.ui.editors.text.content.format`, declared by the SQL editor
-bundle. The public Eclipse service boundary available to query and invoke a
-command is `org.eclipse.ui.handlers.IHandlerService` (`canExecute` and
-`executeCommand`). Inspection of every shipped `plugin.xml` found:
+The pinned product contains a native mutating format route. The following was
+reproduced from the shipped
+`org.jkiss.dbeaver.ui.editors.sql_1.0.180.202605311718.jar` with
+`javap -p -c`; no implementation source was copied:
 
-- keybinding: `CTRL+SHIFT+F`, scheme
-  `org.eclipse.ui.defaultAcceleratorConfiguration`, context
+- command ID: `org.jkiss.dbeaver.ui.editors.text.content.format`
+  (`BaseTextEditorCommands.CMD_CONTENT_FORMAT`);
+- `SQLEditorContributor#createActions` creates a public
+  `RetargetTextEditorAction` and assigns that command ID as its action
+  definition;
+- `SQLEditorContributor#contributeToMenu` adds that retarget action directly to
+  the workbench `edit` menu after the `additions` group;
+- `SQLEditorBase#createActions` creates a public `TextOperationAction` with
+  operation code 15 (`ISourceViewer.FORMAT`), assigns the same command ID, and
+  stores it under the `ContentFormatProposal` action key;
+- `SQLEditorBase#editorContextMenuAboutToShow` obtains that action and adds it
+  directly to the SQL editor context menu's programmatic `format` submenu when
+  the editor is not read-only and its text viewer exists and is editable;
+- `plugin.xml` declares the global `CTRL+SHIFT+F` binding in
+  `org.eclipse.ui.defaultAcceleratorConfiguration` and
   `org.eclipse.ui.contexts.window`;
-- no `activeWhen` expression for an SQL-editor format handler;
-- one `enabledWhen` expression only for the separate
-  `org.jkiss.dbeaver.ui.editors.content.ContentFormatHandler`: variable
-  `activeEditor` must be an instance of
-  `org.jkiss.dbeaver.ui.editors.content.ContentEditor`; this is not evidence
-  of the SQL Editor's handler;
-- no menu contribution URI containing this command ID in the SQL editor or any
-  other shipped bundle;
-- no toolbar contribution containing this command ID.
+- `SQLEditorContributor#contributeToToolBar` returns without adding a format
+  action, and no declarative format toolbar contribution exists.
 
-The command declaration and global keybinding reach the same command ID, and
-no second declarative mutating format surface was found. However, the pinned
-metadata does not prove the SQL Editor's active handler, enabled-state
-contract, or a guardable public activation boundary. Therefore native SQL
-formatting is an **optional fail-closed disabled capability** for Task 7 unless
-a later approved public capability probe proves the scoped handler can be
-atomically guarded. This evidence does not infer a handler from implementation
-source and does not authorize Monaco formatting.
+The public action boundary exposes `AbstractTextEditor.getAction/setAction`,
+`RetargetTextEditorAction.setAction/run`, `TextOperationAction.run/update`, and
+ordinary `IAction` enabled state. That is insufficient to prove one atomic
+scoped guard: the Edit-menu retarget action and SQL context-menu action can run
+the target `IAction` directly, rather than necessarily entering an
+`IHandlerService` command handler installed by the plugin. Replacing the
+editor's action does not prove that an already-retargeted Edit-menu action no
+longer retains the original target.
+
+**Conclusion: explicit fail-closed compatibility blocker.** The pinned
+DBeaver 26.1.0 baseline has reachable mutating format surfaces, but Task 1
+cannot prove that every surface can be guarded atomically through public APIs.
+Under the approved design Monaco must not become editable until this conflict
+is resolved by owner-approved API evidence or an ADR. This is not an optional
+feature absence and no later task may relabel it as one.

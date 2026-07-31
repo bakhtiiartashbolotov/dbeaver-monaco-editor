@@ -1,3 +1,6 @@
 .cache/
 **/target/
 web/node_modules/
+
+__pycache__/
+*.pyc

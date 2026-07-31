@@ -9,4 +9,12 @@
   </parent>
   <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.repository</artifactId>
   <packaging>eclipse-repository</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.feature</artifactId>
+      <version>${revision}</version>
+      <type>eclipse-feature</type>
+    </dependency>
+  </dependencies>
 </project>

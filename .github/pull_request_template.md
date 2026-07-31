@@ -34,6 +34,8 @@ PASS/FAIL — observed result
 
 ## Security and privacy
 
+- [ ] No internal ChatGPT/Codex task, chat, conversation, session, workspace, or share URL is present in public material.
+
 - [ ] No runtime CDN or external network dependency.
 - [ ] No SQL, credentials, connection URLs, database object names, or raw
       bridge payloads added to logs.

@@ -14,7 +14,7 @@
       <plugin>
         <groupId>org.eclipse.tycho.extras</groupId>
         <artifactId>target-platform-validation-plugin</artifactId>
-        <version>5.0.3</version>
+        <version>${tycho.version}</version>
         <executions>
           <execution>
             <id>validate-target-platform</id>

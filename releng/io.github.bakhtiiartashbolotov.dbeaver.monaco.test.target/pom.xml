@@ -9,12 +9,20 @@
   </parent>
   <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target</artifactId>
   <packaging>eclipse-target-definition</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.target</artifactId>
+      <version>${revision}</version>
+      <type>target</type>
+    </dependency>
+  </dependencies>
   <build>
     <plugins>
       <plugin>
         <groupId>org.eclipse.tycho.extras</groupId>
         <artifactId>target-platform-validation-plugin</artifactId>
-        <version>5.0.3</version>
+        <version>${tycho.version}</version>
         <executions>
           <execution>
             <id>validate-target-platform</id>

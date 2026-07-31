@@ -16,4 +16,16 @@ mapfile -t products < <(sed -n 's/^eclipse.product=//p' "$root/configuration/con
 [[ ${#apps[@]} -eq 1 && -n ${apps[0]} ]] || { echo 'ambiguous application ID' >&2; exit 1; }
 [[ ${#products[@]} -eq 1 && -n ${products[0]} ]] || { echo 'ambiguous product ID' >&2; exit 1; }
 printf 'application.id=%s\nproduct.id=%s\nlauncher=%s\n' "${apps[0]}" "${products[0]}" "$root/dbeaver"
+contributor_javap=$(mktemp)
+base_javap=$(mktemp)
+trap 'rm -f "$contributor_javap" "$base_javap"' EXIT
+javap -p -c -classpath "$sql" org.jkiss.dbeaver.ui.editors.sql.SQLEditorContributor > "$contributor_javap"
+javap -p -c -classpath "$sql" org.jkiss.dbeaver.ui.editors.sql.SQLEditorBase > "$base_javap"
+for pattern in 'private void createActions();' 'public void contributeToMenu' 'org.jkiss.dbeaver.ui.editors.text.content.format' 'Field contentFormatProposal' 'String edit'; do
+  grep -Fq "$pattern" "$contributor_javap" || { echo "missing format contributor evidence: $pattern" >&2; exit 1; }
+done
+for pattern in 'protected void createActions();' 'public void editorContextMenuAboutToShow' 'class org/eclipse/ui/texteditor/TextOperationAction' 'bipush        15' 'org.jkiss.dbeaver.ui.editors.text.content.format' 'String format'; do
+  grep -Fq "$pattern" "$base_javap" || { echo "missing format editor evidence: $pattern" >&2; exit 1; }
+done
+echo 'native Format bytecode surface evidence passed'
 echo 'DBeaver baseline verification passed'

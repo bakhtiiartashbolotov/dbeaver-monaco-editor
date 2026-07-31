@@ -9,6 +9,14 @@
   </parent>
   <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.core.tests</artifactId>
   <packaging>eclipse-test-plugin</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target</artifactId>
+      <version>${revision}</version>
+      <type>target</type>
+    </dependency>
+  </dependencies>
   <build>
     <plugins>
       <plugin>

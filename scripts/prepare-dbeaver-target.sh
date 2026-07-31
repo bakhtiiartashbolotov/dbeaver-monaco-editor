@@ -5,11 +5,12 @@ readonly version=26.1.0
 readonly archive_name=dbeaver-ce-${version}-linux-x86_64.tar.gz
 readonly archive_url=https://dbeaver.io/files/${version}/${archive_name}
 readonly digest_file=releng/baseline/${archive_name}.sha256
-readonly cache_dir=.cache/downloads
+readonly repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+readonly cache_root=${repo_root}/.cache
+readonly cache_dir=${cache_root}/downloads
 readonly archive=${cache_dir}/${archive_name}
-readonly install_root=.cache/dbeaver-${version}
+readonly install_root=${cache_root}/dbeaver-${version}
 readonly install=${install_root}/dbeaver
-readonly install_marker=${install_root}/.archive.sha256
 readonly max_redirects=5
 readonly allowed_hosts='dbeaver.io github.com release-assets.githubusercontent.com'
 
@@ -22,8 +23,10 @@ cleanup() {
 trap cleanup EXIT
 
 [[ $# -eq 0 ]] || { echo 'prepare-dbeaver-target.sh accepts no arguments' >&2; exit 2; }
-[[ -f "$digest_file" ]] || { echo "missing committed digest: $digest_file" >&2; exit 1; }
-digest=$(tr -d '\r\n' < "$digest_file")
+[[ -f "$repo_root/$digest_file" ]] || { echo "missing committed digest: $digest_file" >&2; exit 1; }
+mapfile -t digest_lines < "$repo_root/$digest_file"
+[[ ${#digest_lines[@]} -eq 1 ]] || { echo 'digest file must contain exactly one line' >&2; exit 1; }
+digest=${digest_lines[0]}
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo 'invalid committed SHA-256 digest' >&2; exit 1; }
 command -v curl >/dev/null || { echo 'curl is required' >&2; exit 1; }
 command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 1; }
@@ -43,7 +46,8 @@ import sys
 from urllib.parse import urlsplit
 url = urlsplit(sys.argv[1])
 allowed = set(sys.argv[2].split())
-if url.scheme != "https" or url.hostname not in allowed or url.username or url.password:
+if (url.scheme != "https" or url.hostname not in allowed or url.username or url.password
+        or url.port is not None or url.fragment):
     raise SystemExit(f"rejected redirect URL: {sys.argv[1]}")
 print(url.hostname)
 PY
@@ -81,7 +85,16 @@ download_with_validated_redirects() {
         ;;
       301|302|303|307|308)
         (( redirect_count < max_redirects )) || { echo 'redirect limit exceeded' >&2; return 1; }
-        location=$(sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$response_dir/headers" | tr -d '\r')
+        location=$(python3 - "$response_dir/headers" <<'PYLOCATION'
+import sys
+values = []
+for line in open(sys.argv[1], encoding="iso-8859-1"):
+    if line.lower().startswith("location:"):
+        values.append(line.split(":", 1)[1].strip())
+if len(values) == 1:
+    print(values[0])
+PYLOCATION
+)
         [[ -n "$location" && $(printf '%s\n' "$location" | wc -l) -eq 1 ]] || {
           echo 'missing or ambiguous redirect Location' >&2
           return 1
@@ -98,7 +111,19 @@ download_with_validated_redirects() {
   done
 }
 
+cd "$repo_root"
+if [[ -L "$cache_root" ]]; then
+  echo "cache root must not be a symlink: $cache_root" >&2
+  exit 1
+fi
+mkdir -p "$cache_root"
+[[ "$(realpath -P "$cache_root")" == "$cache_root" ]] || { echo 'cache root escaped workspace' >&2; exit 1; }
+if [[ -L "$cache_dir" || -L "$install_root" || -L "$archive" ]]; then
+  echo 'cache download, archive, or installation path must not be a symlink' >&2
+  exit 1
+fi
 mkdir -p "$cache_dir"
+[[ "$(realpath -P "$cache_dir")" == "$cache_dir" ]] || { echo 'download cache escaped workspace' >&2; exit 1; }
 if [[ -f "$archive" && "$(sha256 "$archive")" == "$digest" ]]; then
   echo "reusing verified archive: $archive"
 else
@@ -116,8 +141,8 @@ else
 fi
 [[ "$(sha256 "$archive")" == "$digest" ]] || { echo 'cached archive failed verification' >&2; exit 1; }
 
-if [[ -d "$install" && -f "$install_marker" && "$(cat "$install_marker")" == "$digest" ]]; then
-  echo "reusing prepared installation: $install"
+if [[ -d "$install" ]] && python3 scripts/verify-dbeaver-tree.py "$archive" "$install"; then
+  echo "reusing exact verified installation: $install"
   exit 0
 fi
 
@@ -125,13 +150,13 @@ fi
   echo "replacing incomplete or unverified installation: $install_root"
   rm -rf "$install_root"
 }
-staging_root=$(mktemp -d ".cache/.dbeaver-${version}.staging.XXXXXX")
+staging_root=$(mktemp -d "$cache_root/.dbeaver-${version}.staging.XXXXXX")
 tar -xzf "$archive" -C "$staging_root"
 [[ -d "$staging_root/dbeaver/plugins" ]] || {
   echo 'archive did not contain a complete dbeaver installation' >&2
   exit 1
 }
-printf '%s\n' "$digest" > "$staging_root/.archive.sha256"
+python3 scripts/verify-dbeaver-tree.py "$archive" "$staging_root/dbeaver"
 mv "$staging_root" "$install_root"
 staging_root=''
 echo "prepared DBeaver target: $install"

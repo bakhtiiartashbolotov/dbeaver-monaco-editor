@@ -4,7 +4,9 @@ set -euo pipefail
 required=(
   pom.xml .mvn/wrapper/maven-wrapper.properties mvnw mvnw.cmd .node-version .gitignore
   scripts/verify-layout.sh scripts/bootstrap-workspace.sh scripts/prepare-dbeaver-target.sh
-  scripts/verify-dbeaver-baseline.sh scripts/verify-test-target.sh .github/workflows/ci.yml
+  scripts/verify-dbeaver-baseline.sh scripts/verify-dbeaver-tree.py scripts/verify-target-definitions.py scripts/verify-p2-isolation.py scripts/verify-test-target.sh
+  scripts/test-task1-guards.sh
+  .github/workflows/ci.yml
   releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256
   releng/io.github.bakhtiiartashbolotov.dbeaver.monaco.target/pom.xml
   releng/io.github.bakhtiiartashbolotov.dbeaver.monaco.target/io.github.bakhtiiartashbolotov.dbeaver.monaco.target.target
@@ -40,6 +42,8 @@ required=(
 )
 
 status=0
+command -v rg >/dev/null 2>&1 || { echo 'required scanner unavailable: rg' >&2; exit 1; }
+[[ -x mvnw ]] || { echo 'missing or non-executable Maven wrapper: mvnw' >&2; status=1; }
 for path in "${required[@]}"; do
   if [[ ! -f "$path" ]]; then
     printf 'missing: %s\n' "$path"
