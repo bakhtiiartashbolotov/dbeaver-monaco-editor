@@ -38,6 +38,26 @@ jobs:
         with:
           path: .cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
           key: dbeaver-26.1.0-${{ hashFiles('releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256') }}
+      - name: Install checksum-pinned ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly version=14.1.1
+          readonly asset=ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz
+          readonly url=https://github.com/BurntSushi/ripgrep/releases/download/${version}/${asset}
+          readonly sha256=4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e
+          readonly install_dir=${RUNNER_TEMP}/ripgrep-${version}
+          curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
+            "$url" --output "${RUNNER_TEMP}/${asset}"
+          printf '%s  %s\n' "$sha256" "${RUNNER_TEMP}/${asset}" | sha256sum --check --strict -
+          mkdir -p "$install_dir/bin"
+          tar --extract --gzip --file "${RUNNER_TEMP}/${asset}" --directory "$install_dir"
+          install -m 0755 \
+            "$install_dir/ripgrep-${version}-x86_64-unknown-linux-musl/rg" \
+            "$install_dir/bin/rg"
+          test "$("$install_dir/bin/rg" --version | sed -n '1p')" = \
+            'ripgrep 14.1.1 (rev 4649aa9700)'
+          printf '%s\n' "$install_dir/bin" >> "$GITHUB_PATH"
       - run: bash scripts/verify-layout.sh
       - run: bash scripts/bootstrap-workspace.sh
       - run: ./mvnw -B clean verify
