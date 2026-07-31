@@ -16,9 +16,18 @@ readonly allowed_hosts='dbeaver.io github.com release-assets.githubusercontent.c
 
 temporary_download=''
 staging_root=''
+backup_root=''
+lock_root=''
 cleanup() {
+  status=$?
+  if [[ -n "$backup_root" && -e "$backup_root" ]]; then
+    rm -rf "$install_root"
+    mv "$backup_root" "$install_root"
+  fi
   [[ -z "$temporary_download" ]] || rm -rf "$temporary_download"
   [[ -z "$staging_root" ]] || rm -rf "$staging_root"
+  [[ -z "$lock_root" ]] || rmdir "$lock_root" 2>/dev/null || true
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -124,6 +133,8 @@ if [[ -L "$cache_dir" || -L "$install_root" || -L "$archive" ]]; then
 fi
 mkdir -p "$cache_dir"
 [[ "$(realpath -P "$cache_dir")" == "$cache_dir" ]] || { echo 'download cache escaped workspace' >&2; exit 1; }
+lock_root=$cache_root/.prepare-dbeaver-${version}.lock
+mkdir "$lock_root" || { echo 'another DBeaver preparation is active' >&2; exit 1; }
 if [[ -f "$archive" && "$(sha256 "$archive")" == "$digest" ]]; then
   echo "reusing verified archive: $archive"
 else
@@ -146,17 +157,25 @@ if [[ -d "$install" ]] && python3 scripts/verify-dbeaver-tree.py "$archive" "$in
   exit 0
 fi
 
-[[ ! -e "$install_root" ]] || {
-  echo "replacing incomplete or unverified installation: $install_root"
-  rm -rf "$install_root"
-}
 staging_root=$(mktemp -d "$cache_root/.dbeaver-${version}.staging.XXXXXX")
-tar -xzf "$archive" -C "$staging_root"
+python3 scripts/verify-dbeaver-tree.py --extract "$archive" "$staging_root/dbeaver"
 [[ -d "$staging_root/dbeaver/plugins" ]] || {
   echo 'archive did not contain a complete dbeaver installation' >&2
   exit 1
 }
 python3 scripts/verify-dbeaver-tree.py "$archive" "$staging_root/dbeaver"
+if [[ -e "$install_root" ]]; then
+  echo "replacing incomplete or unverified installation: $install_root"
+  backup_root=$(mktemp -d "$cache_root/.dbeaver-${version}.previous.XXXXXX")
+  rmdir "$backup_root"
+  mv "$install_root" "$backup_root"
+fi
+if [[ ${DBEAVER_PREPARE_TEST_FAIL_PUBLISH:-0} == 1 ]]; then
+  echo 'simulated publication failure' >&2
+  exit 1
+fi
 mv "$staging_root" "$install_root"
 staging_root=''
+[[ -z "$backup_root" ]] || rm -rf "$backup_root"
+backup_root=''
 echo "prepared DBeaver target: $install"

@@ -48,6 +48,7 @@ mv "$temporary/checksum" "$checksum"
 
 bash scripts/bootstrap-workspace.sh >/dev/null
 install=.cache/dbeaver-26.1.0/dbeaver
+install_root=.cache/dbeaver-26.1.0
 archive=.cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
 
 printf 'changed\n' >> "$install/dbeaver.ini"
@@ -68,6 +69,64 @@ bash scripts/prepare-dbeaver-target.sh >"$temporary/removed.out"
 python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
 rg -q 'replacing incomplete or unverified installation' "$temporary/removed.out"
 echo 'negative guard passed: removed installed file repaired'
+
+linked=$(find "$install/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit)
+outside_link=$temporary/outside-hardlink
+ln "$linked" "$outside_link"
+outside_digest=$(sha256sum "$outside_link")
+expect_failure installed-hardlink python3 scripts/verify-dbeaver-tree.py "$archive" "$install"
+rg -q 'installed hardlink is forbidden' "$temporary/installed-hardlink.out"
+bash scripts/prepare-dbeaver-target.sh >"$temporary/hardlink-repair.out"
+test "$(sha256sum "$outside_link")" = "$outside_digest"
+test "$(stat -c %h "$outside_link")" -eq 1
+python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
+echo 'negative guard passed: installed hardlink repaired without outside mutation'
+
+python3 - "$temporary" <<'PY'
+import io
+from pathlib import Path
+import sys
+import tarfile
+
+root = Path(sys.argv[1])
+
+def archive(name, entries):
+    with tarfile.open(root / name, "w:gz") as target:
+        for path, kind, data in entries:
+            info = tarfile.TarInfo(path)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                target.addfile(info)
+            elif kind == "file":
+                info.size = len(data)
+                target.addfile(info, io.BytesIO(data))
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = "../../outside"
+                target.addfile(info)
+
+archive("duplicate-root.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/", "dir", b""),
+                                  ("dbeaver/a", "file", b"a")])
+archive("missing-root.tar.gz", [("dbeaver/a", "file", b"a")])
+archive("unsafe-late.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a"),
+                               ("dbeaver/link", "symlink", b"")])
+PY
+for fixture in duplicate-root missing-root unsafe-late; do
+  destination=$temporary/$fixture-output
+  expect_failure "archive-$fixture" python3 scripts/verify-dbeaver-tree.py --extract \
+    "$temporary/$fixture.tar.gz" "$destination"
+  test ! -e "$destination"
+done
+echo 'negative guards passed: unsafe archives rejected before materialization'
+
+printf 'force rebuild\n' >> "$install/dbeaver.ini"
+find "$install_root" -printf '%P %y %s %f\n' | sort | sha256sum > "$temporary/transaction-before"
+expect_failure publication-rollback env DBEAVER_PREPARE_TEST_FAIL_PUBLISH=1 bash scripts/prepare-dbeaver-target.sh
+find "$install_root" -printf '%P %y %s %f\n' | sort | sha256sum > "$temporary/transaction-after"
+diff -u "$temporary/transaction-before" "$temporary/transaction-after"
+test -z "$(find .cache -maxdepth 1 \( -name '.dbeaver-*.staging.*' -o -name '.dbeaver-*.previous.*' \) -print -quit)"
+echo 'negative guard passed: failed publication restored previous installation'
+bash scripts/prepare-dbeaver-target.sh >/dev/null
 
 find .cache/dbeaver-26.1.0 -printf '%P %s %T@\n' | sort | sha256sum > "$temporary/tree-before"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/reuse.out"
@@ -120,6 +179,35 @@ tree.write(path, encoding="utf-8", xml_declaration=True)
 PY
 expect_failure duplicate-root bash scripts/verify-test-target.sh "$repository" "$production_target" "$temporary/duplicate.target"
 
+for mutation in wrong-root extra-root-sibling wrong-location-tag directory-child dependency-child dependency-attribute; do
+  cp "$test_target" "$temporary/$mutation.target"
+  python3 - "$temporary/$mutation.target" "$mutation" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+path, mutation = sys.argv[1:]
+tree = ET.parse(path)
+root = tree.getroot()
+locations = root.find("locations")
+directory = locations.find("location[@type='Directory']")
+dependencies = locations.find("location[@type='Maven']/dependencies")
+if mutation == "wrong-root":
+    root.tag = "other"
+elif mutation == "extra-root-sibling":
+    ET.SubElement(root, "locations")
+elif mutation == "wrong-location-tag":
+    directory.tag = "other"
+elif mutation == "directory-child":
+    ET.SubElement(directory, "unexpected")
+elif mutation == "dependency-child":
+    ET.SubElement(dependencies, "unexpected")
+else:
+    dependencies[0].set("optional", "false")
+tree.write(path, encoding="utf-8", xml_declaration=True)
+PY
+  expect_failure "target-$mutation" bash scripts/verify-test-target.sh \
+    "$repository" "$production_target" "$temporary/$mutation.target"
+done
+
 cp -a "$repository" "$temporary/exploded-repository"
 mkdir "$temporary/exploded-repository/plugins/injected.tests"
 expect_failure exploded-test-plugin bash scripts/verify-test-target.sh "$temporary/exploded-repository" "$production_target" "$test_target"
@@ -146,5 +234,52 @@ with zipfile.ZipFile(temporary, "w") as target:
 os.replace(temporary, feature_jar)
 PY
 expect_failure packaged-feature-test-plugin bash scripts/verify-test-target.sh "$temporary/feature-repository" "$production_target" "$test_target"
+
+for mutation in feature-version artifact-version unit-version capability-version capability-duplicate; do
+  cp -a "$repository" "$temporary/p2-$mutation"
+  python3 - "$temporary/p2-$mutation" "$mutation" <<'PY'
+import os
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+repo, mutation = Path(sys.argv[1]), sys.argv[2]
+
+def rewrite(path, member, mutate):
+    with zipfile.ZipFile(path) as source:
+        files = {name: source.read(name) for name in source.namelist()}
+    root = ET.fromstring(files[member])
+    mutate(root)
+    files[member] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    replacement = path.with_suffix(".tmp")
+    with zipfile.ZipFile(replacement, "w") as target:
+        for name, data in files.items():
+            target.writestr(name, data)
+    os.replace(replacement, path)
+
+if mutation == "feature-version":
+    feature = next((repo / "features").glob("*.jar"))
+    rewrite(feature, "feature.xml", lambda root: root.findall("plugin")[0].set("version", "9.9.9"))
+elif mutation == "artifact-version":
+    rewrite(repo / "artifacts.jar", "artifacts.xml",
+            lambda root: root.find("./artifacts/artifact[@classifier='osgi.bundle']").set("version", "9.9.9"))
+else:
+    def content_change(root):
+        unit = next(unit for unit in root.findall("./units/unit")
+                    if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
+        capability = unit.find("./provides/provided[@namespace='osgi.bundle']")
+        if mutation == "unit-version":
+            unit.set("version", "9.9.9")
+        elif mutation == "capability-version":
+            capability.set("version", "9.9.9")
+        else:
+            import copy
+            unit.find("provides").append(copy.deepcopy(capability))
+    rewrite(repo / "content.jar", "content.xml", content_change)
+PY
+  expect_failure "p2-$mutation" bash scripts/verify-test-target.sh \
+    "$temporary/p2-$mutation" "$production_target" "$test_target"
+done
 
 echo 'all Task 1 negative and reuse guards passed'
