@@ -52,6 +52,7 @@ bash scripts/bootstrap-workspace.sh >/dev/null
 install=.cache/dbeaver-26.1.0/dbeaver
 install_root=.cache/dbeaver-26.1.0
 archive=.cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
+digest=$(cat "$checksum")
 
 foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
 mkdir "$foreign_lock"
@@ -66,39 +67,55 @@ rmdir "$foreign_lock"
 foreign_lock=''
 echo 'negative guard passed: failed acquisition preserved foreign lock ownership'
 
-printf 'changed\n' >> "$install/dbeaver.ini"
+python3 - "$install/dbeaver.ini" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+data[0] ^= 1
+path.write_bytes(data)
+PY
 bash scripts/prepare-dbeaver-target.sh >"$temporary/modified.out"
-python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
+python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest" >/dev/null
 rg -q 'replacing incomplete or unverified installation' "$temporary/modified.out"
 echo 'negative guard passed: modified installed file repaired'
 
 printf 'extra\n' > "$install/plugins/extra-test-bundle.jar"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/extra.out"
-python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
+python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest" >/dev/null
 rg -q 'replacing incomplete or unverified installation' "$temporary/extra.out"
 echo 'negative guard passed: extra installed bundle repaired'
 
 removed=$(find "$install/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit)
 rm "$removed"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/removed.out"
-python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
+python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest" >/dev/null
 rg -q 'replacing incomplete or unverified installation' "$temporary/removed.out"
 echo 'negative guard passed: removed installed file repaired'
+
+ln -s "$temporary/outside-symlink-target" "$install/plugins/installed-symlink"
+expect_failure installed-symlink python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
+rm "$install/plugins/installed-symlink"
+mkfifo "$install/plugins/installed-special"
+expect_failure installed-special python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
+rm "$install/plugins/installed-special"
+echo 'negative guards passed: installed symlink and special entry rejected'
 
 linked=$(find "$install/plugins" -maxdepth 1 -type f -name '*.jar' -print -quit)
 outside_link=$temporary/outside-hardlink
 ln "$linked" "$outside_link"
 outside_digest=$(sha256sum "$outside_link")
-expect_failure installed-hardlink python3 scripts/verify-dbeaver-tree.py "$archive" "$install"
+expect_failure installed-hardlink python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
 rg -q 'installed hardlink is forbidden' "$temporary/installed-hardlink.out"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/hardlink-repair.out"
 test "$(sha256sum "$outside_link")" = "$outside_digest"
 test "$(stat -c %h "$outside_link")" -eq 1
-python3 scripts/verify-dbeaver-tree.py "$archive" "$install" >/dev/null
+python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest" >/dev/null
 echo 'negative guard passed: installed hardlink repaired without outside mutation'
 
 python3 - "$temporary" <<'PY'
 import io
+import gzip
 from pathlib import Path
 import sys
 import tarfile
@@ -119,25 +136,83 @@ def archive(name, entries):
                 info.type = tarfile.SYMTYPE
                 info.linkname = "../../outside"
                 target.addfile(info)
+            elif kind == "hardlink":
+                info.type = tarfile.LNKTYPE
+                info.linkname = "dbeaver/a"
+                target.addfile(info)
+            elif kind == "special":
+                info.type = tarfile.FIFOTYPE
+                target.addfile(info)
 
 archive("duplicate-root.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/", "dir", b""),
                                   ("dbeaver/a", "file", b"a")])
 archive("missing-root.tar.gz", [("dbeaver/a", "file", b"a")])
 archive("unsafe-late.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a"),
                                ("dbeaver/link", "symlink", b"")])
+base = [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a")]
+archive("file-slash.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/", "file", b"a")])
+archive("root-no-slash.tar.gz", [("dbeaver", "dir", b""), ("dbeaver/a", "file", b"a")])
+archive("hardlink.tar.gz", base + [("dbeaver/hard", "hardlink", b"")])
+archive("special.tar.gz", base + [("dbeaver/fifo", "special", b"")])
+archive("absolute.tar.gz", base + [("/dbeaver/absolute", "file", b"x")])
+archive("traversal.tar.gz", base + [("dbeaver/../outside", "file", b"x")])
+archive("duplicate-path.tar.gz", base + [("dbeaver/a", "file", b"a")])
+
+root_alias = root / "root-no-slash.tar.gz"
+with gzip.open(root_alias, "rb") as source:
+    payload = bytearray(source.read())
+payload[:100] = b"dbeaver\0" + b"\0" * 92
+payload[148:156] = b"        "
+payload[148:156] = f"{sum(payload[:512]):06o}\0 ".encode("ascii")
+with gzip.open(root_alias, "wb") as target:
+    target.write(payload)
 PY
-for fixture in duplicate-root missing-root unsafe-late; do
+for fixture in duplicate-root missing-root unsafe-late file-slash root-no-slash hardlink special absolute traversal duplicate-path; do
   destination=$temporary/$fixture-output
   expect_failure "archive-$fixture" python3 scripts/verify-dbeaver-tree.py --extract \
-    "$temporary/$fixture.tar.gz" "$destination"
+    "$temporary/$fixture.tar.gz" "$destination" "$(sha256sum "$temporary/$fixture.tar.gz" | cut -d' ' -f1)"
   test ! -e "$destination"
 done
+destination=$temporary/digest-mismatch-output
+expect_failure archive-digest-mismatch python3 scripts/verify-dbeaver-tree.py --extract \
+  "$temporary/duplicate-path.tar.gz" "$destination" "$(printf '0%.0s' {1..64})"
+test ! -e "$destination"
 echo 'negative guards passed: unsafe archives rejected before materialization'
 
 printf 'force rebuild\n' >> "$install/dbeaver.ini"
-find "$install_root" -printf '%P %y %s %f\n' | sort | sha256sum > "$temporary/transaction-before"
+python3 - "$install_root" > "$temporary/transaction-before" <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    status = path.lstat()
+    relative = path.relative_to(root).as_posix()
+    if stat.S_ISREG(status.st_mode):
+        print("file", relative, hashlib.sha256(path.read_bytes()).hexdigest())
+    elif stat.S_ISDIR(status.st_mode):
+        print("directory", relative)
+    elif stat.S_ISLNK(status.st_mode):
+        print("symlink", relative, os.readlink(path))
+    else:
+        print("special", relative, status.st_mode)
+PY
 expect_failure publication-rollback env DBEAVER_PREPARE_TEST_FAIL_PUBLISH=1 bash scripts/prepare-dbeaver-target.sh
-find "$install_root" -printf '%P %y %s %f\n' | sort | sha256sum > "$temporary/transaction-after"
+python3 - "$install_root" > "$temporary/transaction-after" <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    status = path.lstat()
+    relative = path.relative_to(root).as_posix()
+    if stat.S_ISREG(status.st_mode):
+        print("file", relative, hashlib.sha256(path.read_bytes()).hexdigest())
+    elif stat.S_ISDIR(status.st_mode):
+        print("directory", relative)
+    elif stat.S_ISLNK(status.st_mode):
+        print("symlink", relative, os.readlink(path))
+    else:
+        print("special", relative, status.st_mode)
+PY
 diff -u "$temporary/transaction-before" "$temporary/transaction-after"
 test -z "$(find .cache -maxdepth 1 \( -name '.dbeaver-*.staging.*' -o -name '.dbeaver-*.previous.*' \) -print -quit)"
 echo 'negative guard passed: failed publication restored previous installation'
@@ -162,6 +237,32 @@ rm .cache
 mv "$cache_backup" .cache
 cache_backup=''
 echo 'negative guard passed: cache symlink escape preserved outside sentinel'
+
+for escape in downloads installation archive; do
+  outside=$temporary/outside-$escape
+  mkdir "$outside"
+  printf 'outside sentinel\n' > "$outside/sentinel"
+  case "$escape" in
+    downloads)
+      protected=.cache/downloads
+      ;;
+    installation)
+      protected=.cache/dbeaver-26.1.0
+      ;;
+    archive)
+      protected=.cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
+      ;;
+  esac
+  saved=$temporary/saved-$escape
+  mv "$protected" "$saved"
+  ln -s "$outside" "$protected"
+  expect_failure "$escape-symlink-escape" bash scripts/prepare-dbeaver-target.sh
+  test "$(cat "$outside/sentinel")" = 'outside sentinel'
+  test "$(find "$outside" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+  rm "$protected"
+  mv "$saved" "$protected"
+done
+echo 'negative guards passed: cache child symlink escapes preserved outside sentinels'
 
 repository=repository/target/repository
 production_target=releng/io.github.bakhtiiartashbolotov.dbeaver.monaco.target/io.github.bakhtiiartashbolotov.dbeaver.monaco.target.target

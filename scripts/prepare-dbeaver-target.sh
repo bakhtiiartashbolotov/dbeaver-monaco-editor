@@ -154,18 +154,17 @@ else
 fi
 [[ "$(sha256 "$archive")" == "$digest" ]] || { echo 'cached archive failed verification' >&2; exit 1; }
 
-if [[ -d "$install" ]] && python3 scripts/verify-dbeaver-tree.py "$archive" "$install"; then
+if [[ -d "$install" ]] && python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"; then
   echo "reusing exact verified installation: $install"
   exit 0
 fi
 
 staging_root=$(mktemp -d "$cache_root/.dbeaver-${version}.staging.XXXXXX")
-python3 scripts/verify-dbeaver-tree.py --extract "$archive" "$staging_root/dbeaver"
+python3 scripts/verify-dbeaver-tree.py --extract "$archive" "$staging_root/dbeaver" "$digest"
 [[ -d "$staging_root/dbeaver/plugins" ]] || {
   echo 'archive did not contain a complete dbeaver installation' >&2
   exit 1
 }
-python3 scripts/verify-dbeaver-tree.py "$archive" "$staging_root/dbeaver"
 if [[ -e "$install_root" ]]; then
   echo "replacing incomplete or unverified installation: $install_root"
   backup_root=$(mktemp -d "$cache_root/.dbeaver-${version}.previous.XXXXXX")
