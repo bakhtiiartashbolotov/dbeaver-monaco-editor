@@ -44,4 +44,30 @@ All routes below use Eclipse commands and the public `IHandlerService` (`canExec
 
 ## Native formatting compatibility finding
 
-Formatting is present and publicly command-backed: `org.jkiss.dbeaver.ui.editors.text.content.format`. Its global keybinding is `Ctrl+Shift+F`; SQL menu enablement/visibility is resolved through the Eclipse command/handler service. The active handler contract is queried through public `IHandlerService.canExecute/executeCommand`; the shipped content-editor handler is `org.jkiss.dbeaver.ui.editors.content.ContentFormatHandler`. Therefore Task 7 can guard the public command route; Monaco must remain read-only if its scoped active handler cannot be proven and guarded at runtime. No direct mutating format toolbar contribution was found.
+The pinned product contains the mutating command
+`org.jkiss.dbeaver.ui.editors.text.content.format`, declared by the SQL editor
+bundle. The public Eclipse service boundary available to query and invoke a
+command is `org.eclipse.ui.handlers.IHandlerService` (`canExecute` and
+`executeCommand`). Inspection of every shipped `plugin.xml` found:
+
+- keybinding: `CTRL+SHIFT+F`, scheme
+  `org.eclipse.ui.defaultAcceleratorConfiguration`, context
+  `org.eclipse.ui.contexts.window`;
+- no `activeWhen` expression for an SQL-editor format handler;
+- one `enabledWhen` expression only for the separate
+  `org.jkiss.dbeaver.ui.editors.content.ContentFormatHandler`: variable
+  `activeEditor` must be an instance of
+  `org.jkiss.dbeaver.ui.editors.content.ContentEditor`; this is not evidence
+  of the SQL Editor's handler;
+- no menu contribution URI containing this command ID in the SQL editor or any
+  other shipped bundle;
+- no toolbar contribution containing this command ID.
+
+The command declaration and global keybinding reach the same command ID, and
+no second declarative mutating format surface was found. However, the pinned
+metadata does not prove the SQL Editor's active handler, enabled-state
+contract, or a guardable public activation boundary. Therefore native SQL
+formatting is an **optional fail-closed disabled capability** for Task 7 unless
+a later approved public capability probe proves the scoped handler can be
+atomically guarded. This evidence does not infer a handler from implementation
+source and does not authorize Monaco formatting.

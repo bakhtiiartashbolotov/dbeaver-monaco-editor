@@ -1,1 +1,42 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?><target name="DBeaver CE 26.1.0 tests"><locations><location path="${project_loc:io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target}/../../.cache/dbeaver-26.1.0/dbeaver" type="Directory"/><location includeDependencyDepth="infinite" includeDependencyScopes="compile" includeSource="false" missingManifest="error" type="Maven"><dependencies><dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter-api</artifactId><version>5.13.4</version></dependency><dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter-engine</artifactId><version>5.13.4</version></dependency><dependency><groupId>org.junit.platform</groupId><artifactId>junit-platform-launcher</artifactId><version>1.13.4</version></dependency></dependencies></location></locations></target>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<target name="DBeaver CE 26.1.0 tests">
+  <locations>
+    <location
+        path="${project_loc:io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target}/../../.cache/dbeaver-26.1.0/dbeaver"
+        type="Directory"/>
+    <location
+        includeDependencyDepth="infinite"
+        includeDependencyScopes="compile,runtime"
+        includeSource="false"
+        missingManifest="error"
+        type="Maven">
+      <dependencies>
+        <dependency>
+          <groupId>org.junit.jupiter</groupId>
+          <artifactId>junit-jupiter-api</artifactId>
+          <version>5.13.4</version>
+        </dependency>
+        <dependency>
+          <groupId>org.junit.jupiter</groupId>
+          <artifactId>junit-jupiter-engine</artifactId>
+          <version>5.13.4</version>
+        </dependency>
+        <dependency>
+          <groupId>org.junit.platform</groupId>
+          <artifactId>junit-platform-launcher</artifactId>
+          <version>1.13.4</version>
+        </dependency>
+        <dependency>
+          <groupId>org.junit.platform</groupId>
+          <artifactId>junit-platform-suite-api</artifactId>
+          <version>1.13.4</version>
+        </dependency>
+        <dependency>
+          <groupId>org.junit.platform</groupId>
+          <artifactId>junit-platform-suite-engine</artifactId>
+          <version>1.13.4</version>
+        </dependency>
+      </dependencies>
+    </location>
+  </locations>
+</target>

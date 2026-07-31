@@ -10,17 +10,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Java 21
-        uses: actions/setup-java@7a445ee88d4e23b52c33c877d4f7b7a6d3db87a8 # v4.7.1
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
       - name: Set up Node
-        uses: actions/setup-node@1e60f620b9541d7c243d3452f8c7b1f7b84c8e04 # v4.0.3
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -28,7 +28,7 @@ jobs:
       - name: Pin npm
         run: npm install --global npm@11.16.0
       - name: Cache verified DBeaver archive
-        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.2.1
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
           key: dbeaver-26.1.0-${{ hashFiles('releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256') }}
@@ -41,7 +41,7 @@ jobs:
       - run: npm --prefix web test
       - run: npm --prefix web run build
       - name: Upload p2 repository and baseline evidence
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: task-1-scaffold
           path: |

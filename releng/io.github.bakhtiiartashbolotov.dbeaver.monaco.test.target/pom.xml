@@ -1,1 +1,28 @@
-<?xml version="1.0"?><project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><parent><groupId>io.github.bakhtiiartashbolotov</groupId><artifactId>dbeaver-monaco-editor</artifactId><version>${revision}</version><relativePath>../../pom.xml</relativePath></parent><artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target</artifactId><packaging>eclipse-target-definition</packaging></project>
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.github.bakhtiiartashbolotov</groupId>
+    <artifactId>dbeaver-monaco-editor</artifactId>
+    <version>${revision}</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+  <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target</artifactId>
+  <packaging>eclipse-target-definition</packaging>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.eclipse.tycho.extras</groupId>
+        <artifactId>target-platform-validation-plugin</artifactId>
+        <version>5.0.3</version>
+        <executions>
+          <execution>
+            <id>validate-target-platform</id>
+            <phase>verify</phase>
+            <goals><goal>validate-target-platform</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

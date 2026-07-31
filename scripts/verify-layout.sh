@@ -47,7 +47,7 @@ for path in "${required[@]}"; do
   fi
 done
 
-if rg -n --glob '!docs/**' --glob '!scripts/verify-layout.sh' \
+if rg -n --hidden --glob '!.git/**' --glob '!docs/**' --glob '!scripts/verify-layout.sh' \
   'dbeaver\.io/update|releases/latest|<dbeaver\.p2\.version>latest</dbeaver\.p2\.version>' \
   .; then
   printf '%s\n' 'forbidden unpinned DBeaver build input found' >&2

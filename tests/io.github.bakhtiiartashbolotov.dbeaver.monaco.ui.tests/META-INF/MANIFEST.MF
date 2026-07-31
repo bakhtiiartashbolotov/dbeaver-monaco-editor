@@ -1,7 +1,10 @@
 Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
-Bundle-Name: DBeaver Monaco Ui Tests
+Bundle-Name: DBeaver Monaco UI Tests
 Bundle-SymbolicName: io.github.bakhtiiartashbolotov.dbeaver.monaco.ui.tests;singleton:=true
 Bundle-Version: 0.1.0.qualifier
 Bundle-RequiredExecutionEnvironment: JavaSE-21
-Require-Bundle: org.eclipse.osgi,junit-jupiter-api;bundle-version="[5.13.4,5.13.5)",junit-jupiter-engine;bundle-version="[5.13.4,5.13.5)",junit-platform-launcher;bundle-version="[1.13.4,1.13.5)"
+Require-Bundle: org.eclipse.osgi,
+ junit-jupiter-api;bundle-version="[5.13.4,5.13.5)",
+ junit-jupiter-engine;bundle-version="[5.13.4,5.13.5)",
+ junit-platform-launcher;bundle-version="[1.13.4,1.13.5)"

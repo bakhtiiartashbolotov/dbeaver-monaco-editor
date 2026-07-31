@@ -16,6 +16,7 @@ ADRs record decisions that implementation agents must not change silently.
 | [0008](decisions/0008-fit-recovery-inside-wire-limit.md) | Accepted | Cap recovery text at 10 Mi code units so worst-case JSON remains bounded |
 | [0009](decisions/0009-gate-editing-on-recovery-headroom.md) | Accepted | Require checkpoint plus one maximum edit batch to fit before enabling Monaco editing |
 | [0010](decisions/0010-version-readiness-and-flush-barriers-by-epoch.md) | Accepted | Version readiness generations and drain Browser queues before native commands |
+| [0011](decisions/0011-complete-tycho-junit5-test-overlay.md) | Accepted | Complete Tycho 5.0.3's test-only JUnit 5 runtime overlay |
 
 ## Changing a decision
 
