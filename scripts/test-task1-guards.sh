@@ -123,7 +123,7 @@ import tarfile
 root = Path(sys.argv[1])
 
 def archive(name, entries):
-    with tarfile.open(root / name, "w:gz") as target:
+    with tarfile.open(root / name, "w:gz", format=tarfile.GNU_FORMAT) as target:
         for path, kind, data in entries:
             info = tarfile.TarInfo(path)
             if kind == "dir":
@@ -143,6 +143,10 @@ def archive(name, entries):
             elif kind == "special":
                 info.type = tarfile.FIFOTYPE
                 target.addfile(info)
+            elif kind == "contiguous":
+                info.type = tarfile.CONTTYPE
+                info.size = len(data)
+                target.addfile(info, io.BytesIO(data))
 
 archive("duplicate-root.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/", "dir", b""),
                                   ("dbeaver/a", "file", b"a")])
@@ -157,6 +161,17 @@ archive("special.tar.gz", base + [("dbeaver/fifo", "special", b"")])
 archive("absolute.tar.gz", base + [("/dbeaver/absolute", "file", b"x")])
 archive("traversal.tar.gz", base + [("dbeaver/../outside", "file", b"x")])
 archive("duplicate-path.tar.gz", base + [("dbeaver/a", "file", b"a")])
+archive("contiguous.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a", "contiguous", b"a")])
+archive("missing-parent.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/b", "file", b"b")])
+archive("file-ancestor-first.tar.gz", base + [("dbeaver/a/b", "file", b"b")])
+archive("file-ancestor-last.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/b", "file", b"b"),
+                                         ("dbeaver/a", "file", b"a")])
+archive("identity-collision.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a/", "dir", b""),
+                                      ("dbeaver/a", "file", b"a")])
+long_directory = "dbeaver/" + "canonical-long-directory-" * 5
+long_file = long_directory + "/" + "canonical-long-file-" * 5
+archive("longlink-valid.tar.gz", [("dbeaver/", "dir", b""), (long_directory + "/", "dir", b""),
+                                  (long_file, "file", b"long")])
 
 root_alias = root / "root-no-slash.tar.gz"
 with gzip.open(root_alias, "rb") as source:
@@ -167,7 +182,8 @@ payload[148:156] = f"{sum(payload[:512]):06o}\0 ".encode("ascii")
 with gzip.open(root_alias, "wb") as target:
     target.write(payload)
 PY
-for fixture in duplicate-root missing-root unsafe-late file-slash root-no-slash hardlink special absolute traversal duplicate-path; do
+for fixture in duplicate-root missing-root unsafe-late file-slash root-no-slash hardlink special absolute traversal \
+  duplicate-path contiguous missing-parent file-ancestor-first file-ancestor-last identity-collision; do
   destination=$temporary/$fixture-output
   expect_failure "archive-$fixture" python3 scripts/verify-dbeaver-tree.py --extract \
     "$temporary/$fixture.tar.gz" "$destination" "$(sha256sum "$temporary/$fixture.tar.gz" | cut -d' ' -f1)"
@@ -177,6 +193,36 @@ destination=$temporary/digest-mismatch-output
 expect_failure archive-digest-mismatch python3 scripts/verify-dbeaver-tree.py --extract \
   "$temporary/duplicate-path.tar.gz" "$destination" "$(printf '0%.0s' {1..64})"
 test ! -e "$destination"
+destination=$temporary/longlink-valid-output
+python3 scripts/verify-dbeaver-tree.py --extract "$temporary/longlink-valid.tar.gz" "$destination" \
+  "$(sha256sum "$temporary/longlink-valid.tar.gz" | cut -d' ' -f1)" >/dev/null
+test "$(cat "$destination/$(printf 'canonical-long-directory-%.0s' {1..5})/$(printf 'canonical-long-file-%.0s' {1..5})")" = long
+echo 'positive guard passed: canonical GNU LongLink directory and file extracted'
+
+cp "$temporary/longlink-valid.tar.gz" "$temporary/snapshot-source.tar.gz"
+snapshot_digest=$(sha256sum "$temporary/snapshot-source.tar.gz" | cut -d' ' -f1)
+snapshot_destination=$temporary/snapshot-output
+python3 - "$temporary/snapshot-source.tar.gz" "$snapshot_destination" "$snapshot_digest" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+import tarfile
+
+source_path, destination, digest = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+spec = importlib.util.spec_from_file_location("tree_verifier", "scripts/verify-dbeaver-tree.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+snapshots = module.verified_snapshot(source_path, digest)
+snapshot = next(snapshots)
+source_path.write_bytes(b"mutated original archive\n")
+with tarfile.open(fileobj=snapshot, mode="r:gz") as archive:
+    records, expected = module.validated_members(archive)
+    module.extract_members(archive, records, destination)
+assert module.installed_manifest(destination) == expected
+snapshots.close()
+PY
+test "$(cat "$snapshot_destination/$(printf 'canonical-long-directory-%.0s' {1..5})/$(printf 'canonical-long-file-%.0s' {1..5})")" = long
+echo 'positive guard passed: verified private snapshot resisted source mutation'
 echo 'negative guards passed: unsafe archives rejected before materialization'
 
 printf 'force rebuild\n' >> "$install/dbeaver.ini"

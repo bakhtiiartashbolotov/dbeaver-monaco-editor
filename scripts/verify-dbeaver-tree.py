@@ -6,75 +6,102 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import sys
 import tarfile
+import tempfile
+
+REGULAR_TYPES = (b"0", b"\0")
+DIRECTORY_TYPE = b"5"
 
 
 def fail(message: str) -> None:
     raise SystemExit(message)
 
 
-def raw_header_name(source: tarfile.TarFile, member: tarfile.TarInfo) -> str:
+def header_at(source: tarfile.TarFile, offset: int) -> bytes:
     position = source.fileobj.tell()
-    source.fileobj.seek(member.offset)
+    source.fileobj.seek(offset)
     header = source.fileobj.read(tarfile.BLOCKSIZE)
-    if len(header) != tarfile.BLOCKSIZE:
-        fail(f"cannot read archive header: {member.name}")
-    if header[156:157] == tarfile.GNUTYPE_LONGNAME:
-        try:
-            size = int(header[124:136].rstrip(b"\0 ") or b"0", 8)
-        except ValueError:
-            fail(f"invalid GNU long-name header: {member.name}")
-        name = source.fileobj.read(size).split(b"\0", 1)[0]
-        prefix = b""
-    else:
-        name = header[:100].split(b"\0", 1)[0]
-        prefix = header[345:500].split(b"\0", 1)[0]
     source.fileobj.seek(position)
+    if len(header) != tarfile.BLOCKSIZE:
+        fail("cannot read complete archive header")
+    return header
+
+
+def decode_header_name(header: bytes) -> str:
+    name = header[:100].split(b"\0", 1)[0]
+    prefix = header[345:500].split(b"\0", 1)[0]
     try:
         decoded = name.decode("utf-8")
         if prefix:
             decoded = f"{prefix.decode('utf-8')}/{decoded}"
     except UnicodeDecodeError:
-        fail(f"non-UTF-8 archive path: {member.name}")
+        fail("non-UTF-8 archive path")
     return decoded
 
 
-def validated_members(source: tarfile.TarFile) -> tuple[list[tarfile.TarInfo], dict[str, tuple[str, int, str | None]]]:
-    members: list[tarfile.TarInfo] = []
+def raw_member(source: tarfile.TarFile, member: tarfile.TarInfo) -> tuple[str, bytes]:
+    first = header_at(source, member.offset)
+    first_type = first[156:157]
+    if first_type == tarfile.GNUTYPE_LONGNAME:
+        try:
+            size = int(first[124:136].rstrip(b"\0 ") or b"0", 8)
+        except ValueError:
+            fail(f"invalid GNU long-name header: {member.name}")
+        position = source.fileobj.tell()
+        source.fileobj.seek(member.offset + tarfile.BLOCKSIZE)
+        encoded = source.fileobj.read(size)
+        source.fileobj.seek(position)
+        if len(encoded) != size or not encoded.endswith(b"\0"):
+            fail(f"malformed GNU long-name data: {member.name}")
+        try:
+            raw_name = encoded[:-1].decode("utf-8")
+        except UnicodeDecodeError:
+            fail(f"non-UTF-8 GNU long name: {member.name}")
+        actual = header_at(source, member.offset_data - tarfile.BLOCKSIZE)
+        return raw_name, actual[156:157]
+    if first_type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGLINK):
+        fail(f"unsupported archive extension header: {member.name}")
+    return decode_header_name(first), first_type
+
+
+def validated_members(
+        source: tarfile.TarFile,
+) -> tuple[dict[str, tuple[str, tarfile.TarInfo]], dict[str, tuple[str, int, str | None]]]:
+    records: dict[str, tuple[str, tarfile.TarInfo]] = {}
     expected: dict[str, tuple[str, int, str | None]] = {}
-    seen: set[str] = set()
-    root_count = 0
     for member in source:
-        raw = raw_header_name(source, member)
-        path = PurePosixPath(member.name)
-        canonical = path.as_posix()
-        expected_spelling = f"{canonical}/" if member.isdir() else canonical
-        if (raw != expected_spelling or path.is_absolute() or not path.parts
-                or any(part in ("", ".", "..") for part in path.parts)
-                or "//" in raw or raw.startswith("./") or "\\" in raw
-                or member.name != canonical):
-            fail(f"unsafe archive path: {member.name}")
-        if path.parts[0] != "dbeaver":
-            fail(f"unexpected archive top-level path: {member.name}")
-        normalized = canonical.rstrip("/")
-        if normalized in seen:
-            fail(f"duplicate archive path: {normalized}")
-        seen.add(normalized)
-        members.append(member)
-        if len(path.parts) == 1:
-            relative = ""
+        raw, typeflag = raw_member(source, member)
+        if typeflag == DIRECTORY_TYPE:
+            kind = "directory"
+        elif typeflag in REGULAR_TYPES:
+            kind = "file"
         else:
-            relative = PurePosixPath(*path.parts[1:]).as_posix()
-        if not relative:
-            if not member.isdir():
+            fail(f"unsupported archive entry type {typeflag!r}: {member.name}")
+
+        if (not raw or raw.startswith("/") or raw.startswith("./") or "//" in raw or "\\" in raw
+                or any(part in ("", ".", "..") for part in raw.rstrip("/").split("/"))):
+            fail(f"unsafe archive path: {raw}")
+        canonical = raw[:-1] if kind == "directory" and raw.endswith("/") else raw
+        expected_spelling = f"{canonical}/" if kind == "directory" else canonical
+        if raw != expected_spelling or member.name != canonical:
+            fail(f"noncanonical archive path spelling: {raw}")
+        if not canonical.startswith("dbeaver") or canonical.split("/", 1)[0] != "dbeaver":
+            fail(f"unexpected archive top-level path: {raw}")
+        if canonical in records:
+            fail(f"duplicate or conflicting archive path: {canonical}")
+        records[canonical] = (kind, member)
+
+        if canonical == "dbeaver":
+            if kind != "directory":
                 fail("top-level dbeaver entry is not a directory")
-            root_count += 1
             continue
-        if member.isdir():
-            expected[relative] = ("directory", 0, None)
-        elif member.isfile():
+        relative = canonical.removeprefix("dbeaver/")
+        if kind == "directory":
+            expected[relative] = (kind, 0, None)
+        else:
             extracted = source.extractfile(member)
             if extracted is None:
                 fail(f"cannot read archive file: {member.name}")
@@ -85,48 +112,74 @@ def validated_members(source: tarfile.TarFile) -> tuple[list[tarfile.TarInfo], d
                 size += len(chunk)
             if size != member.size:
                 fail(f"archive size mismatch: {member.name}")
-            expected[relative] = ("file", size, digest.hexdigest())
-        else:
-            fail(f"unsupported archive entry type: {member.name}")
-    if root_count != 1:
-        fail(f"archive must contain exactly one explicit dbeaver directory entry; found {root_count}")
+            expected[relative] = (kind, size, digest.hexdigest())
+
+    root = records.get("dbeaver")
+    if root is None or root[0] != "directory":
+        fail("archive must contain exactly one explicit canonical dbeaver/ directory")
     if not expected:
         fail("archive contains no DBeaver entries")
-    return members, expected
+    for canonical in records:
+        if canonical == "dbeaver":
+            continue
+        parent = canonical.rsplit("/", 1)[0]
+        parent_record = records.get(parent)
+        if parent_record is None:
+            fail(f"archive path has no explicit parent directory: {canonical}")
+        if parent_record[0] != "directory":
+            fail(f"archive file is an ancestor of another member: {parent}")
+    return records, expected
 
 
-def verify_digest(stream, expected_digest: str) -> None:
+def verified_snapshot(archive: Path, expected_digest: str):
     if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
         fail("expected SHA-256 must be exactly 64 lowercase hexadecimal characters")
-    digest = hashlib.sha256()
-    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-        digest.update(chunk)
-    if digest.hexdigest() != expected_digest:
-        fail(f"archive SHA-256 mismatch: expected {expected_digest}, got {digest.hexdigest()}")
-    stream.seek(0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(archive, flags)
+    except OSError as error:
+        fail(f"cannot securely open archive: {error}")
+    with os.fdopen(descriptor, "rb") as source, tempfile.TemporaryFile() as snapshot:
+        status = os.fstat(source.fileno())
+        if not stat.S_ISREG(status.st_mode):
+            fail("archive source is not a regular file")
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+            snapshot.write(chunk)
+        if digest.hexdigest() != expected_digest:
+            fail(f"archive SHA-256 mismatch: expected {expected_digest}, got {digest.hexdigest()}")
+        snapshot.flush()
+        snapshot.seek(0)
+        yield snapshot
 
 
-def extract_members(source: tarfile.TarFile, members: list[tarfile.TarInfo], install: Path) -> None:
+def extract_members(
+        source: tarfile.TarFile,
+        records: dict[str, tuple[str, tarfile.TarInfo]],
+        install: Path,
+) -> None:
     if install.exists() or install.is_symlink():
         fail(f"extraction destination already exists: {install}")
+    directories = sorted(
+        ((name, member) for name, (kind, member) in records.items()
+         if kind == "directory" and name != "dbeaver"),
+        key=lambda item: (item[0].count("/"), item[0]),
+    )
+    files = sorted((name, member) for name, (kind, member) in records.items() if kind == "file")
     install.mkdir(parents=True)
-    for member in members:
-        if len(PurePosixPath(member.name).parts) == 1:
-            continue
-        relative = Path(*PurePosixPath(member.name).parts[1:])
-        destination = install / relative
-        if member.isdir():
-            destination.mkdir()
-            os.chmod(destination, member.mode & 0o777)
-        else:
-            stream = source.extractfile(member)
-            if stream is None:
-                fail(f"cannot extract archive file: {member.name}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("xb") as target:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    target.write(chunk)
-            os.chmod(destination, member.mode & 0o777)
+    for name, _ in directories:
+        (install / name.removeprefix("dbeaver/")).mkdir()
+    for name, member in files:
+        destination = install / name.removeprefix("dbeaver/")
+        stream = source.extractfile(member)
+        if stream is None:
+            fail(f"cannot extract archive file: {member.name}")
+        with destination.open("xb") as target:
+            shutil.copyfileobj(stream, target, 1024 * 1024)
+        os.chmod(destination, member.mode & 0o777)
+    for name, member in reversed(directories):
+        os.chmod(install / name.removeprefix("dbeaver/"), member.mode & 0o777)
 
 
 def installed_manifest(install: Path) -> dict[str, tuple[str, int, str | None]]:
@@ -166,15 +219,14 @@ def main() -> None:
     extract = len(sys.argv) == 5 and sys.argv[1] == "--extract"
     if (extract and len(sys.argv) != 5) or (not extract and len(sys.argv) != 4):
         fail(f"usage: {sys.argv[0]} [--extract] <archive> <installation> <expected-sha256>")
-    archive = Path(sys.argv[2] if extract else sys.argv[1]).resolve(strict=True)
+    archive = Path(sys.argv[2] if extract else sys.argv[1])
     install = Path(sys.argv[3] if extract else sys.argv[2])
     expected_digest = sys.argv[4] if extract else sys.argv[3]
-    with archive.open("rb") as archive_bytes:
-        verify_digest(archive_bytes, expected_digest)
-        with tarfile.open(fileobj=archive_bytes, mode="r:gz") as source:
-            members, expected = validated_members(source)
+    for snapshot in verified_snapshot(archive, expected_digest):
+        with tarfile.open(fileobj=snapshot, mode="r:gz") as source:
+            records, expected = validated_members(source)
             if extract:
-                extract_members(source, members, install)
+                extract_members(source, records, install)
     if not install.exists():
         fail(f"installation is missing: {install}")
     actual = installed_manifest(install)
