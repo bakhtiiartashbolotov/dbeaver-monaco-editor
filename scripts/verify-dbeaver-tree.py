@@ -14,6 +14,7 @@ import tempfile
 
 REGULAR_TYPES = (b"0", b"\0")
 DIRECTORY_TYPE = b"5"
+ManifestEntry = tuple[str, int, int, str | None]
 
 
 def fail(message: str) -> None:
@@ -69,9 +70,9 @@ def raw_member(source: tarfile.TarFile, member: tarfile.TarInfo) -> tuple[str, b
 
 def validated_members(
         source: tarfile.TarFile,
-) -> tuple[dict[str, tuple[str, tarfile.TarInfo]], dict[str, tuple[str, int, str | None]]]:
+) -> tuple[dict[str, tuple[str, tarfile.TarInfo]], dict[str, ManifestEntry]]:
     records: dict[str, tuple[str, tarfile.TarInfo]] = {}
-    expected: dict[str, tuple[str, int, str | None]] = {}
+    expected: dict[str, ManifestEntry] = {}
     for member in source:
         raw, typeflag = raw_member(source, member)
         if typeflag == DIRECTORY_TYPE:
@@ -99,10 +100,11 @@ def validated_members(
         if canonical == "dbeaver":
             if kind != "directory":
                 fail("top-level dbeaver entry is not a directory")
+            expected[""] = (kind, member.mode & 0o7777, 0, None)
             continue
         relative = canonical.removeprefix("dbeaver/")
         if kind == "directory":
-            expected[relative] = (kind, 0, None)
+            expected[relative] = (kind, member.mode & 0o7777, 0, None)
         else:
             extracted = source.extractfile(member)
             if extracted is None:
@@ -114,7 +116,7 @@ def validated_members(
                 size += len(chunk)
             if size != member.size:
                 fail(f"archive size mismatch: {member.name}")
-            expected[relative] = (kind, size, digest.hexdigest())
+            expected[relative] = (kind, member.mode & 0o7777, size, digest.hexdigest())
 
     root = records.get("dbeaver")
     if root is None or root[0] != "directory":
@@ -179,18 +181,23 @@ def extract_members(
             fail(f"cannot extract archive file: {member.name}")
         with destination.open("xb") as target:
             shutil.copyfileobj(stream, target, 1024 * 1024)
-        os.chmod(destination, member.mode & 0o777)
+        os.chmod(destination, member.mode & 0o7777)
     for name, member in reversed(directories):
-        os.chmod(install / name.removeprefix("dbeaver/"), member.mode & 0o777)
+        os.chmod(install / name.removeprefix("dbeaver/"), member.mode & 0o7777)
+    os.chmod(install, records["dbeaver"][1].mode & 0o7777)
 
 
-def installed_manifest(install: Path) -> dict[str, tuple[str, int, str | None]]:
-    actual: dict[str, tuple[str, int, str | None]] = {}
+def installed_manifest(install: Path) -> dict[str, ManifestEntry]:
+    actual: dict[str, ManifestEntry] = {}
     inodes: set[tuple[int, int]] = set()
     root_status = install.lstat()
     if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
         fail(f"installation root is not a real directory: {install}")
-    for current, directories, files in os.walk(install, topdown=True, followlinks=False):
+    actual[""] = ("directory", stat.S_IMODE(root_status.st_mode), 0, None)
+    def walk_error(error: OSError) -> None:
+        fail(f"cannot traverse installed tree: {error}")
+    for current, directories, files in os.walk(
+            install, topdown=True, onerror=walk_error, followlinks=False):
         current_path = Path(current)
         for name in sorted(directories + files):
             path = current_path / name
@@ -199,7 +206,7 @@ def installed_manifest(install: Path) -> dict[str, tuple[str, int, str | None]]:
             if stat.S_ISLNK(status.st_mode):
                 fail(f"installed symlink is forbidden: {relative}")
             if stat.S_ISDIR(status.st_mode):
-                actual[relative] = ("directory", 0, None)
+                actual[relative] = ("directory", stat.S_IMODE(status.st_mode), 0, None)
             elif stat.S_ISREG(status.st_mode):
                 if status.st_nlink != 1:
                     fail(f"installed hardlink is forbidden: {relative} has {status.st_nlink} links")
@@ -211,7 +218,7 @@ def installed_manifest(install: Path) -> dict[str, tuple[str, int, str | None]]:
                 with path.open("rb") as source:
                     for chunk in iter(lambda: source.read(1024 * 1024), b""):
                         digest.update(chunk)
-                actual[relative] = ("file", status.st_size, digest.hexdigest())
+                actual[relative] = ("file", stat.S_IMODE(status.st_mode), status.st_size, digest.hexdigest())
             else:
                 fail(f"installed special file is forbidden: {relative}")
     return actual

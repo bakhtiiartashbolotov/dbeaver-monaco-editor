@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Verify the generated production p2 repository is a closed four-bundle set."""
+"""Verify the generated production p2 repository is a closed five-artifact set."""
 
 from __future__ import annotations
 
+import hashlib
+import lzma
 from pathlib import Path
 import stat
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
-EXPECTED = {
+BUNDLES = {
     "io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge",
     "io.github.bakhtiiartashbolotov.dbeaver.monaco.core",
     "io.github.bakhtiiartashbolotov.dbeaver.monaco.ui",
     "io.github.bakhtiiartashbolotov.dbeaver.monaco.web",
 }
+FEATURE = "io.github.bakhtiiartashbolotov.dbeaver.monaco.feature"
+TOP_LEVEL = {"artifacts.jar", "artifacts.xml.xz", "content.jar", "content.xml.xz", "p2.index", "features", "plugins"}
 TEST_MARKERS = (".tests", "junit", "surefire", "opentest4j", "apiguardian", "vintage")
 
 
@@ -54,85 +58,154 @@ def manifest_identity(bundle: Path) -> tuple[str, str]:
     return header("Bundle-SymbolicName").split(";", 1)[0], header("Bundle-Version")
 
 
-def compressed_xml(repository: Path, jar_name: str, xml_name: str) -> ET.Element:
-    path = repository / jar_name
-    if not path.is_file() or path.is_symlink():
-        fail(f"missing repository metadata: {path}")
+def metadata_bytes(repository: Path, base: str) -> bytes:
+    xz_path = repository / f"{base}.xml.xz"
+    jar_path = repository / f"{base}.jar"
+    if not xz_path.is_file() or xz_path.is_symlink() or not jar_path.is_file() or jar_path.is_symlink():
+        fail(f"missing authoritative {base} metadata representations")
     try:
-        with zipfile.ZipFile(path) as archive:
-            return ET.fromstring(archive.read(xml_name))
-    except (KeyError, ET.ParseError, zipfile.BadZipFile) as error:
-        fail(f"invalid repository metadata {path}: {error}")
+        xz_data = lzma.decompress(xz_path.read_bytes())
+        with zipfile.ZipFile(jar_path) as archive:
+            if archive.namelist() != [f"{base}.xml"]:
+                fail(f"unexpected {base}.jar members: {archive.namelist()}")
+            jar_data = archive.read(f"{base}.xml")
+    except (lzma.LZMAError, zipfile.BadZipFile, KeyError) as error:
+        fail(f"unreadable {base} metadata: {error}")
+    if xz_data != jar_data:
+        fail(f"{base} XZ/JAR metadata representations diverge")
+    return xz_data
 
 
-def assert_exact(actual: list[str] | set[str], label: str) -> None:
-    values = list(actual)
-    if len(values) != len(set(values)):
-        fail(f"duplicate {label}: {values}")
-    if set(values) != EXPECTED:
-        fail(f"unexpected {label}: {sorted(set(values) ^ EXPECTED)}")
-    for value in values:
-        if any(marker in value.lower() for marker in TEST_MARKERS):
-            fail(f"test-only {label}: {value}")
+def properties(element: ET.Element) -> dict[str, str]:
+    values = [(item.attrib.get("name", ""), item.attrib.get("value", ""))
+              for item in element.findall("./properties/property")]
+    if len(values) != len(dict(values)):
+        fail(f"duplicate properties on {element.tag}")
+    return dict(values)
+
+
+def exact_range(version: str) -> str:
+    return f"[{version},{version}]"
 
 
 def main() -> None:
     if len(sys.argv) != 2:
         fail(f"usage: {sys.argv[0]} <repository-directory>")
     repository = Path(sys.argv[1])
+    if not repository.is_dir() or repository.is_symlink():
+        fail(f"missing real repository directory: {repository}")
+    entries = {entry.name for entry in repository.iterdir()}
+    if entries != TOP_LEVEL:
+        fail(f"unexpected repository top-level entries: {sorted(entries ^ TOP_LEVEL)}")
+
+    index_lines = [line for line in (repository / "p2.index").read_text(encoding="utf-8").splitlines()
+                   if line and not line.startswith("#")]
+    expected_index = [
+        r"artifact.repository.factory.order=artifacts.xml.xz,artifacts.xml,\!",
+        r"metadata.repository.factory.order=content.xml.xz,content.xml,\!",
+        "version=1",
+    ]
+    if index_lines != expected_index:
+        fail(f"unexpected p2.index factory order: {index_lines}")
+
+    artifacts = ET.fromstring(metadata_bytes(repository, "artifacts"))
+    content = ET.fromstring(metadata_bytes(repository, "content"))
+
     plugin_jars = closed_jars(repository / "plugins", "plugins")
     plugin_identities = [manifest_identity(bundle) for bundle in plugin_jars]
-    plugin_bsns = [identity[0] for identity in plugin_identities]
-    assert_exact(plugin_bsns, "plugin BSNs")
-    if len(plugin_identities) != len(set(plugin_identities)):
-        fail(f"duplicate plugin identities: {plugin_identities}")
-    expected_identities = set(plugin_identities)
+    if len(plugin_identities) != 4 or {item[0] for item in plugin_identities} != BUNDLES:
+        fail(f"unexpected plugin identities: {plugin_identities}")
+    if any(any(marker in name.lower() for marker in TEST_MARKERS) for name, _ in plugin_identities):
+        fail("test-only production plugin")
+    identities = set(plugin_identities)
 
     feature_jars = closed_jars(repository / "features", "features")
     if len(feature_jars) != 1:
-        fail(f"expected exactly one packaged feature, found {len(feature_jars)}")
+        fail(f"expected one feature JAR, found {len(feature_jars)}")
     try:
         with zipfile.ZipFile(feature_jars[0]) as archive:
-            feature = ET.fromstring(archive.read("feature.xml"))
+            feature_xml = ET.fromstring(archive.read("feature.xml"))
     except (KeyError, ET.ParseError, zipfile.BadZipFile) as error:
         fail(f"invalid packaged feature: {error}")
-    feature_plugins = [element.attrib.get("id", "") for element in feature.findall("plugin")]
-    assert_exact(feature_plugins, "packaged feature plugin IDs")
-    feature_identities = {(element.attrib.get("id", ""), element.attrib.get("version", ""))
-                          for element in feature.findall("plugin")}
-    if feature_identities != expected_identities or len(feature.findall("plugin")) != 4:
-        fail(f"packaged feature plugin identities differ: {sorted(feature_identities ^ expected_identities)}")
+    allowed_feature_children = {"description", "copyright", "license", "plugin"}
+    if any(child.tag not in allowed_feature_children for child in feature_xml):
+        fail("packaged feature contains include/import/require or unknown structure")
+    plugins = feature_xml.findall("plugin")
+    feature_identities = {(item.attrib.get("id", ""), item.attrib.get("version", "")) for item in plugins}
+    if len(plugins) != 4 or feature_identities != identities or any(list(item) for item in plugins):
+        fail("packaged feature plugin identities or structure differ")
+    feature_version = feature_xml.attrib.get("version", "")
 
-    artifacts = compressed_xml(repository, "artifacts.jar", "artifacts.xml")
-    artifact_elements = [artifact
-                        for artifact in artifacts.findall("./artifacts/artifact")
-                        if artifact.attrib.get("classifier") == "osgi.bundle"]
-    artifact_bundles = [artifact.attrib.get("id", "") for artifact in artifact_elements]
-    assert_exact(artifact_bundles, "osgi.bundle artifacts")
-    artifact_identities = [(artifact.attrib.get("id", ""), artifact.attrib.get("version", ""))
-                           for artifact in artifact_elements]
-    if len(artifact_identities) != len(set(artifact_identities)) or set(artifact_identities) != expected_identities:
-        fail(f"unexpected osgi.bundle artifact identities: {artifact_identities}")
+    artifact_elements = artifacts.findall("./artifacts/artifact")
+    artifact_roles = [(item.attrib.get("classifier", ""), item.attrib.get("id", ""), item.attrib.get("version", ""))
+                      for item in artifact_elements]
+    expected_artifact_roles = {("osgi.bundle", name, version) for name, version in identities}
+    expected_artifact_roles.add(("org.eclipse.update.feature", FEATURE, feature_version))
+    if len(artifact_roles) != 5 or set(artifact_roles) != expected_artifact_roles:
+        fail(f"unexpected artifact universe: {artifact_roles}")
+    for element, (classifier, identifier, version) in zip(artifact_elements, artifact_roles):
+        jar = (repository / "plugins" / f"{identifier}_{version}.jar" if classifier == "osgi.bundle"
+               else repository / "features" / f"{identifier}_{version}.jar")
+        if not jar.is_file():
+            fail(f"missing declared artifact JAR: {jar}")
+        data = jar.read_bytes()
+        props = properties(element)
+        if props.get("artifact.size") != str(len(data)) or props.get("download.size") != str(len(data)):
+            fail(f"incorrect declared artifact size: {identifier}")
+        if props.get("download.checksum.sha-256") != hashlib.sha256(data).hexdigest():
+            fail(f"incorrect SHA-256: {identifier}")
+        if props.get("download.checksum.sha-512") != hashlib.sha512(data).hexdigest():
+            fail(f"incorrect SHA-512: {identifier}")
 
-    content = compressed_xml(repository, "content.jar", "content.xml")
-    provided_bundles = []
-    unit_identities = []
-    for unit in content.findall("./units/unit"):
+    units = content.findall("./units/unit")
+    unit_map = {unit.attrib.get("id", ""): unit for unit in units}
+    if len(units) != 8 or len(unit_map) != 8:
+        fail(f"expected exactly eight unique IUs, found {len(units)}")
+    bundle_ids = {name for name, _ in identities}
+    feature_jar_id = f"{FEATURE}.feature.jar"
+    feature_group_id = f"{FEATURE}.feature.group"
+    categories = [unit for unit in units if properties(unit).get("org.eclipse.equinox.p2.type.category") == "true"]
+    expected_ids = bundle_ids | {feature_jar_id, feature_group_id, "a.jre.javase"}
+    if len(categories) != 1:
+        fail(f"expected exactly one category IU, found {len(categories)}")
+    category = categories[0]
+    if set(unit_map) != expected_ids | {category.attrib["id"]}:
+        fail(f"unexpected IU universe: {sorted(set(unit_map) ^ (expected_ids | {category.attrib['id']}))}")
+    if unit_map["a.jre.javase"].attrib.get("version") != "21.0.0":
+        fail("unexpected Java execution-environment IU")
+
+    for identifier, version in identities:
+        unit = unit_map[identifier]
+        if unit.attrib.get("version") != version:
+            fail(f"bundle IU version mismatch: {identifier}")
         provisions = unit.findall("./provides/provided")
-        bundles = [item for item in provisions if item.attrib.get("namespace") == "osgi.bundle"]
-        if bundles:
-            identity = (unit.attrib.get("id", ""), unit.attrib.get("version", ""))
-            provided_bundles.append(identity[0])
-            unit_identities.append(identity)
-            if len(bundles) != 1 or (bundles[0].attrib.get("name"), bundles[0].attrib.get("version")) != identity:
-                fail(f"invalid osgi.bundle capability for IU {identity}")
-            iu = [item for item in provisions if item.attrib.get("namespace") == "org.eclipse.equinox.p2.iu"]
-            if len(iu) != 1 or (iu[0].attrib.get("name"), iu[0].attrib.get("version")) != identity:
-                fail(f"invalid p2 IU identity capability for IU {identity}")
-    assert_exact(provided_bundles, "osgi.bundle IUs")
-    if len(unit_identities) != len(set(unit_identities)) or set(unit_identities) != expected_identities:
-        fail(f"unexpected osgi.bundle IU identities: {unit_identities}")
-    print("production p2 plugin, feature, artifact, and IU sets are exact")
+        bundle_caps = [item for item in provisions if item.attrib.get("namespace") == "osgi.bundle"]
+        identity_caps = [item for item in provisions if item.attrib.get("namespace") == "org.eclipse.equinox.p2.iu"]
+        if len(bundle_caps) != 1 or len(identity_caps) != 1:
+            fail(f"invalid bundle capability cardinality: {identifier}")
+        for capability in bundle_caps + identity_caps:
+            if (capability.attrib.get("name"), capability.attrib.get("version")) != (identifier, version):
+                fail(f"invalid bundle capability identity: {identifier}")
+
+    if unit_map[feature_jar_id].attrib.get("version") != feature_version:
+        fail("feature.jar IU version mismatch")
+    group = unit_map[feature_group_id]
+    if group.attrib.get("version") != feature_version:
+        fail("feature.group IU version mismatch")
+    requirements = group.findall("./requires/required")
+    required_edges = {(item.attrib.get("namespace"), item.attrib.get("name"), item.attrib.get("range"))
+                      for item in requirements}
+    expected_edges = {("org.eclipse.equinox.p2.iu", name, exact_range(version)) for name, version in identities}
+    expected_edges.add(("org.eclipse.equinox.p2.iu", feature_jar_id, exact_range(feature_version)))
+    if len(requirements) != 5 or required_edges != expected_edges:
+        fail(f"unexpected feature.group requirements: {required_edges ^ expected_edges}")
+
+    category_requirements = category.findall("./requires/required")
+    category_edge = ("org.eclipse.equinox.p2.iu", feature_group_id, exact_range(feature_version))
+    if len(category_requirements) != 1 or tuple(category_requirements[0].attrib.get(name, "")
+            for name in ("namespace", "name", "range")) != category_edge:
+        fail("category does not require exactly the generated feature group")
+    print("production p2 repository topology, representations, artifacts, hashes, and IUs are exact")
 
 
 if __name__ == "__main__":

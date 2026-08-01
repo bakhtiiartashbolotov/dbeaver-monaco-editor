@@ -21,9 +21,20 @@ The product's `configuration/config.ini` contains one unambiguous application an
 
 ## Public compile contract
 
-`javap -public` against the shipped bundles proves:
+`javap -public` and a compile-only contract against the shipped bundles prove
+the exact public `SQLEditorPresentation` surface:
 
-- public `SQLEditorPresentation`, including `createPresentation`, `dispose`, `getControl`, `getTextViewer`, `getAdapter`, `canShowPresentation(SQLEditor, boolean)`, and `canHidePresentation(SQLEditor)`;
+- `void createPresentation(Composite, SQLEditor)`;
+- default `void showPresentation(SQLEditor, boolean)`;
+- default `void hidePresentation(SQLEditor)`;
+- default `boolean canShowPresentation(SQLEditor, boolean)`;
+- default `boolean canHidePresentation(SQLEditor)`;
+- `void dispose()`;
+- `ISelectionProvider getSelectionProvider()`.
+
+The interface does **not** declare `getControl`, `getTextViewer`, or
+`getAdapter`. The remaining public contract evidence includes:
+
 - public `SQLEditor.showExtraPresentation(String)` and `showExtraPresentation(SQLPresentationDescriptor)`;
 - `SQLEditorCommands.CMD_EXECUTE_STATEMENT` = `org.jkiss.dbeaver.ui.editors.sql.run.statement` and `CMD_EXECUTE_SCRIPT` = `org.jkiss.dbeaver.ui.editors.sql.run.script`;
 - Eclipse `ISelectionProvider`, `IDocumentExtension4`, `IRewriteTarget.beginCompoundChange/endCompoundChange`, and `IUndoManager.undo/redo` are public.
@@ -32,13 +43,17 @@ The SQL presentation schema is shipped at `schema/org.jkiss.dbeaver.sqlPresentat
 
 ## Critical native command routes and surfaces
 
-All routes below use Eclipse commands and the public `IHandlerService` (`canExecute`, `executeCommand`) plus command enabled state; none of the inspected toolbar/menu/key contributions directly mutates editor text.
+Statement and Script are command-handler-backed. Save is created through
+`WorkbenchCommandAction`/`CommandAction` and reaches
+`IHandlerService.executeCommand`. Undo and Redo additionally have direct
+`IAction` paths, so an action definition ID does not prove that every surface
+enters `IHandlerService`.
 
 | Route | Command ID | Handler/service evidence | Shipped surfaces |
 | --- | --- | --- | --- |
 | Save | `org.eclipse.ui.file.save` | Eclipse default `SaveHandler`; active `ISaveablePart` | File menu, workbench save image/toolbar action, global `M1+S` |
-| Undo | `org.eclipse.ui.edit.undo` | Eclipse text-editor action/undo manager via command service | Edit menu, workbench action/image, global `M1+Z` |
-| Redo | `org.eclipse.ui.edit.redo` | Eclipse text-editor action/undo manager via command service | Edit menu, workbench action/image, global `M1+Y` and `M1+M2+Z` |
+| Undo | `org.eclipse.ui.edit.undo` | Command path plus direct editor `IAction`: `BasicTextEditorActionContributor` installs a global handler with `IActionBars.setGlobalActionHandler`; `ActionFactory.UNDO` creates `LabelRetargetAction`; `RetargetAction.run/runWithEvent` invokes the captured action; `AbstractTextEditor` adds Undo directly to its context menu | Edit/context menus, retarget/global handler, workbench action/image, global `M1+Z` |
+| Redo | `org.eclipse.ui.edit.redo` | Command path plus the same direct global-handler and retarget-action mechanism as Undo | Edit menu, retarget/global handler, workbench action/image, global `M1+Y` and `M1+M2+Z` |
 | Statement | `org.jkiss.dbeaver.ui.editors.sql.run.statement` | public command; `SQLEditorHandlerExecute`; enabled by `org.jkiss.dbeaver.ui.editors.sql.canExecute=statement` | SQL toolbar, SQL/editor context menus, global focused-context `Ctrl+Enter` (`Command+Enter` on macOS) |
 | Script | `org.jkiss.dbeaver.ui.editors.sql.run.script` | public command; `SQLEditorHandlerExecute`; enabled by `org.jkiss.dbeaver.ui.editors.sql.canExecute=script` | SQL toolbar, SQL/editor context menus, global focused-context `Alt+X` |
 
@@ -83,3 +98,17 @@ cannot prove that every surface can be guarded atomically through public APIs.
 Under the approved design Monaco must not become editable until this conflict
 is resolved by owner-approved API evidence or an ADR. This is not an optional
 feature absence and no later task may relabel it as one.
+
+## Native Undo/Redo compatibility finding
+
+Undo and Redo are separate explicit fail-closed compatibility blockers for an
+editable Monaco presentation. Task 1 cannot prove one atomic public guard
+across editor actions, `IActionBars` global handlers, retarget actions,
+Edit/context menus, toolbar contributions, and keybindings. The direct
+`IAction.run()` routes may bypass a plugin-installed command handler even when
+`actionDefinitionId` is present.
+
+ADR 0012 records proposed options. No option is accepted here. A feasibility
+decision is required before Task 7. This blocks editable Monaco on the pinned
+baseline, but it does not block pure-core, non-editable Task 2 after Task 1 is
+merged.

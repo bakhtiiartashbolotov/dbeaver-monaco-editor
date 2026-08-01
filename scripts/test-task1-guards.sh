@@ -6,9 +6,14 @@ cd "$repo_root"
 temporary=$(mktemp -d)
 cache_backup=''
 foreign_lock=''
+cp mvnw "$temporary/mvnw.original"
+cp releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256 "$temporary/checksum.original"
 
 cleanup() {
+  cp "$temporary/mvnw.original" mvnw 2>/dev/null || true
   chmod +x mvnw 2>/dev/null || true
+  cp "$temporary/checksum.original" \
+    releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256 2>/dev/null || true
   if [[ -n "$cache_backup" && -e "$cache_backup" ]]; then
     rm -rf .cache
     mv "$cache_backup" .cache
@@ -53,6 +58,48 @@ install=.cache/dbeaver-26.1.0/dbeaver
 install_root=.cache/dbeaver-26.1.0
 archive=.cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
 digest=$(cat "$checksum")
+
+launcher_mode=$(stat -c '%a' "$install/dbeaver")
+jre_mode=$(stat -c '%a' "$install/jre/bin/java")
+regular=$install/configuration/config.ini
+regular_mode=$(stat -c '%a' "$regular")
+directory=$install/plugins
+directory_mode=$(stat -c '%a' "$directory")
+root_mode=$(stat -c '%a' "$install")
+chmod 0644 "$install/dbeaver" "$install/jre/bin/java"
+chmod 0600 "$regular"
+chmod 0700 "$directory" "$install"
+expect_failure installed-mode-drift python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
+bash scripts/prepare-dbeaver-target.sh >"$temporary/mode-repair.out"
+test "$(stat -c '%a' "$install/dbeaver")" = "$launcher_mode"
+test "$(stat -c '%a' "$install/jre/bin/java")" = "$jre_mode"
+test "$(stat -c '%a' "$regular")" = "$regular_mode"
+test "$(stat -c '%a' "$directory")" = "$directory_mode"
+test "$(stat -c '%a' "$install")" = "$root_mode"
+echo 'negative guard passed: launcher, JRE, regular-file, directory, and root modes repaired'
+
+(
+  trap 'chmod "$launcher_mode" "$install/dbeaver"' EXIT
+  chmod 0644 "$install/dbeaver"
+  expect_failure launcher-not-executable bash scripts/verify-dbeaver-baseline.sh
+  rg -q 'DBeaver launcher is not executable' "$temporary/launcher-not-executable.out"
+)
+(
+  trap 'chmod "$jre_mode" "$install/jre/bin/java"' EXIT
+  chmod 0644 "$install/jre/bin/java"
+  expect_failure jre-not-executable bash scripts/verify-dbeaver-baseline.sh
+  rg -q 'bundled DBeaver JRE is not executable' "$temporary/jre-not-executable.out"
+)
+mkdir "$temporary/drift-javap"
+real_javap=$(command -v javap)
+cat > "$temporary/drift-javap/javap" <<EOF
+#!/usr/bin/env bash
+"$real_javap" "\$@" | sed '/hidePresentation(org.jkiss.dbeaver.ui.editors.sql.SQLEditor);/d'
+EOF
+chmod +x "$temporary/drift-javap/javap"
+expect_failure api-contract-drift env PATH="$temporary/drift-javap:$PATH" bash scripts/verify-dbeaver-baseline.sh
+rg -q 'SQLEditorPresentation public API contract drifted' "$temporary/api-contract-drift.out"
+echo 'negative guards passed: executable and public API contract diagnostics'
 
 foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
 mkdir "$foreign_lock"
@@ -200,12 +247,13 @@ expect_failure archive-digest-mismatch python3 scripts/verify-dbeaver-tree.py --
   "$temporary/duplicate-path.tar.gz" "$destination" "$(printf '0%.0s' {1..64})"
 test ! -e "$destination"
 destination=$temporary/longlink-valid-output
-python3 scripts/verify-dbeaver-tree.py --extract "$temporary/longlink-valid.tar.gz" "$destination" \
-  "$(sha256sum "$temporary/longlink-valid.tar.gz" | cut -d' ' -f1)" >/dev/null
+(umask 077; python3 scripts/verify-dbeaver-tree.py --extract "$temporary/longlink-valid.tar.gz" "$destination" \
+  "$(sha256sum "$temporary/longlink-valid.tar.gz" | cut -d' ' -f1)" >/dev/null)
 long_output_directory=$destination/$(printf 'canonical-long-directory-%.0s' {1..5})
 long_output_file=$long_output_directory/$(printf 'canonical-long-file-%.0s' {1..5})
 test "$(stat -c '%a' "$long_output_directory")" = 755
 test "$(stat -c '%a' "$long_output_file")" = 644
+test "$(stat -c '%a' "$destination")" = 755
 test "$(cat "$long_output_file")" = long
 echo 'positive guard passed: canonical GNU LongLink directory and file extracted'
 
@@ -244,9 +292,9 @@ for path in sorted(root.rglob("*")):
     status = path.lstat()
     relative = path.relative_to(root).as_posix()
     if stat.S_ISREG(status.st_mode):
-        print("file", relative, hashlib.sha256(path.read_bytes()).hexdigest())
+        print("file", relative, oct(stat.S_IMODE(status.st_mode)), hashlib.sha256(path.read_bytes()).hexdigest())
     elif stat.S_ISDIR(status.st_mode):
-        print("directory", relative)
+        print("directory", relative, oct(stat.S_IMODE(status.st_mode)))
     elif stat.S_ISLNK(status.st_mode):
         print("symlink", relative, os.readlink(path))
     else:
@@ -261,9 +309,9 @@ for path in sorted(root.rglob("*")):
     status = path.lstat()
     relative = path.relative_to(root).as_posix()
     if stat.S_ISREG(status.st_mode):
-        print("file", relative, hashlib.sha256(path.read_bytes()).hexdigest())
+        print("file", relative, oct(stat.S_IMODE(status.st_mode)), hashlib.sha256(path.read_bytes()).hexdigest())
     elif stat.S_ISDIR(status.st_mode):
-        print("directory", relative)
+        print("directory", relative, oct(stat.S_IMODE(status.st_mode)))
     elif stat.S_ISLNK(status.st_mode):
         print("symlink", relative, os.readlink(path))
     else:
@@ -294,7 +342,7 @@ mv "$cache_backup" .cache
 cache_backup=''
 echo 'negative guard passed: cache symlink escape preserved outside sentinel'
 
-for escape in downloads installation archive; do
+for escape in downloads installation archive; do (
   outside=$temporary/outside-$escape
   mkdir "$outside"
   printf 'outside sentinel\n' > "$outside/sentinel"
@@ -311,13 +359,20 @@ for escape in downloads installation archive; do
   esac
   saved=$temporary/saved-$escape
   mv "$protected" "$saved"
+  restore_escape() {
+    [[ ! -L "$protected" ]] || rm "$protected"
+    [[ ! -e "$protected" ]] || mv "$protected" "$temporary/unexpected-$escape"
+    [[ ! -e "$saved" ]] || mv "$saved" "$protected"
+  }
+  trap restore_escape EXIT
   ln -s "$outside" "$protected"
   expect_failure "$escape-symlink-escape" bash scripts/prepare-dbeaver-target.sh
   test "$(cat "$outside/sentinel")" = 'outside sentinel'
   test "$(find "$outside" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
   rm "$protected"
   mv "$saved" "$protected"
-done
+  trap - EXIT
+); done
 echo 'negative guards passed: cache child symlink escapes preserved outside sentinels'
 
 repository=repository/target/repository
@@ -452,6 +507,89 @@ else:
 PY
   expect_failure "p2-$mutation" bash scripts/verify-test-target.sh \
     "$temporary/p2-$mutation" "$production_target" "$test_target"
+done
+
+for mutation in xz-test-iu xz-test-artifact jar-divergence index-order extra-iu extra-artifact \
+  feature-group-edge feature-import feature-include feature-require unexpected-top-level; do
+  cp -a "$repository" "$temporary/closed-p2-$mutation"
+  python3 - "$temporary/closed-p2-$mutation" "$mutation" <<'PY'
+import lzma
+import os
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+repo, mutation = Path(sys.argv[1]), sys.argv[2]
+
+def read(base, representation):
+    if representation == "xz":
+        return ET.fromstring(lzma.decompress((repo / f"{base}.xml.xz").read_bytes()))
+    with zipfile.ZipFile(repo / f"{base}.jar") as archive:
+        return ET.fromstring(archive.read(f"{base}.xml"))
+
+def write(base, representation, root):
+    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if representation == "xz":
+        (repo / f"{base}.xml.xz").write_bytes(lzma.compress(data))
+    else:
+        path = repo / f"{base}.jar"
+        temporary = path.with_suffix(".tmp")
+        with zipfile.ZipFile(temporary, "w") as archive:
+            archive.writestr(f"{base}.xml", data)
+        os.replace(temporary, path)
+
+def both(base, mutate):
+    for representation in ("xz", "jar"):
+        root = read(base, representation)
+        mutate(root)
+        write(base, representation, root)
+
+if mutation == "xz-test-iu":
+    root = read("content", "xz")
+    ET.SubElement(root.find("units"), "unit", {"id": "junit-platform-engine", "version": "1.13.4"})
+    write("content", "xz", root)
+elif mutation == "xz-test-artifact":
+    root = read("artifacts", "xz")
+    ET.SubElement(root.find("artifacts"), "artifact", {
+        "classifier": "osgi.bundle", "id": "junit-platform-engine", "version": "1.13.4"})
+    write("artifacts", "xz", root)
+elif mutation == "jar-divergence":
+    root = read("content", "jar")
+    root.set("name", "diverged")
+    write("content", "jar", root)
+elif mutation == "index-order":
+    (repo / "p2.index").write_text(
+        "version=1\nmetadata.repository.factory.order=content.xml.xz,content.xml,\\!\n"
+        "artifact.repository.factory.order=artifacts.xml.xz,artifacts.xml,\\!\n", encoding="utf-8")
+elif mutation == "extra-iu":
+    both("content", lambda root: ET.SubElement(root.find("units"), "unit", {"id": "extra.iu", "version": "1.0.0"}))
+elif mutation == "extra-artifact":
+    both("artifacts", lambda root: ET.SubElement(root.find("artifacts"), "artifact", {
+        "classifier": "binary", "id": "extra.artifact", "version": "1.0.0"}))
+elif mutation == "feature-group-edge":
+    def add_edge(root):
+        group = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.group"))
+        ET.SubElement(group.find("requires"), "required", {
+            "namespace": "org.eclipse.equinox.p2.iu", "name": "extra.iu", "range": "[1.0.0,1.0.0]"})
+    both("content", add_edge)
+elif mutation.startswith("feature-"):
+    feature = next((repo / "features").glob("*.jar"))
+    with zipfile.ZipFile(feature) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    root = ET.fromstring(files["feature.xml"])
+    ET.SubElement(root, mutation.removeprefix("feature-"))
+    files["feature.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    temporary = feature.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, feature)
+else:
+    (repo / "unexpected.xml").write_text("unexpected", encoding="utf-8")
+PY
+  expect_failure "closed-p2-$mutation" bash scripts/verify-test-target.sh \
+    "$temporary/closed-p2-$mutation" "$production_target" "$test_target"
 done
 
 echo 'all Task 1 negative and reuse guards passed'
