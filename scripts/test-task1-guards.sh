@@ -5,7 +5,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$repo_root"
 temporary=$(mktemp -d)
 foreign_lock=''
+foreign_lock_owned=false
 suite_cache_backup=$temporary/cache.original
+cache_archive_seed=$temporary/cache-archive.seed
 had_cache=false
 cleanup_done=false
 tracked_saved=false
@@ -18,8 +20,8 @@ cleanup() {
   fi
   cleanup_done=true
   trap - EXIT INT TERM HUP
-  if [[ -n "$foreign_lock" && -d "$foreign_lock" ]]; then
-    rmdir "$foreign_lock" 2>/dev/null || true
+  if [[ "$foreign_lock_owned" == true && -n "$foreign_lock" ]]; then
+    rm -rf "$foreign_lock" 2>/dev/null || true
   fi
   if [[ "$cache_saved" == true ]]; then
     rm -rf .cache 2>/dev/null || true
@@ -49,12 +51,31 @@ done
 tracked_saved=true
 if [[ -e .cache || -L .cache ]]; then
   had_cache=true
+  python3 - "$cache_archive_seed" <<'PY'
+import hashlib
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+source = Path(".cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz")
+expected_file = Path("releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256")
+if source.exists() and all(not part.is_symlink() for part in (Path(".cache"), source.parent)):
+    status = source.lstat()
+    expected = expected_file.read_text(encoding="ascii").strip()
+    if stat.S_ISREG(status.st_mode) and status.st_nlink == 1:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        if digest == expected:
+            shutil.copyfile(source, sys.argv[1])
+PY
+  cache_saved=true
   mv .cache "$suite_cache_backup"
 fi
 cache_saved=true
 mkdir .cache
-if [[ "$had_cache" == true && -d "$suite_cache_backup" && ! -L "$suite_cache_backup" ]]; then
-  cp -a "$suite_cache_backup/." .cache/
+if [[ -f "$cache_archive_seed" ]]; then
+  mkdir .cache/downloads
+  cp "$cache_archive_seed" .cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
 fi
 
 if [[ ${TASK1_GUARD_TEST_FAIL_SETUP:-0} == 1 ]]; then
@@ -62,7 +83,9 @@ if [[ ${TASK1_GUARD_TEST_FAIL_SETUP:-0} == 1 ]]; then
   exit 74
 fi
 
-if [[ ${1:-} == --transaction-self-test-child || ${1:-} == --transaction-signal-child ]]; then
+if [[ ${1:-} == --transaction-self-test-child || ${1:-} == --transaction-signal-child \
+    || ${1:-} == --transaction-owned-lock-child ]]; then
+  printf 'transaction mutation reached\n' >&2
   chmod 0600 mvnw
   printf '\nmutated\n' >> .mvn/wrapper/maven-wrapper.properties
   printf '\nmutated\n' >> releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256
@@ -72,6 +95,11 @@ if [[ ${1:-} == --transaction-self-test-child || ${1:-} == --transaction-signal-
     printf '\nmutated\n' >> .cache/dbeaver-26.1.0/dbeaver/dbeaver.ini
   if [[ ${1:-} == --transaction-signal-child ]]; then
     kill -TERM $$
+  elif [[ ${1:-} == --transaction-owned-lock-child ]]; then
+    foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
+    foreign_lock_owned=true
+    mkdir "$foreign_lock"
+    printf 'owned\n' > "$foreign_lock/owner"
   fi
   exit 73
 elif [[ $# -ne 0 ]]; then
@@ -104,11 +132,27 @@ PY
 
 assert_forced_restore() {
   local label=$1
-  shift
+  local expected_status=$2
+  local marker=$3
+  shift 3
   state_fingerprint | sha256sum > "$temporary/$label.before"
   git diff --binary | sha256sum >> "$temporary/$label.before"
   git status --porcelain=v1 >> "$temporary/$label.before"
-  if "$@"; then
+  set +e
+  "$@" >"$temporary/$label.transaction.out" 2>&1
+  local actual_status=$?
+  set -e
+  if [[ "$actual_status" -ne "$expected_status" ]]; then
+    cat "$temporary/$label.transaction.out" >&2
+    echo "unexpected transaction status: $label expected=$expected_status actual=$actual_status" >&2
+    exit 1
+  fi
+  if [[ -n "$marker" ]] && ! rg -q "$marker" "$temporary/$label.transaction.out"; then
+    cat "$temporary/$label.transaction.out" >&2
+    echo "transaction point not reached: $label" >&2
+    exit 1
+  fi
+  if [[ "$actual_status" -eq 0 ]]; then
     echo "forced transaction failure unexpectedly succeeded: $label" >&2
     exit 1
   fi
@@ -119,22 +163,69 @@ assert_forced_restore() {
   echo "negative guard passed: $label restored exact caller state"
 }
 
-assert_forced_restore transaction-child bash scripts/test-task1-guards.sh --transaction-self-test-child
-assert_forced_restore transaction-signal bash scripts/test-task1-guards.sh --transaction-signal-child
-assert_forced_restore setup-failure env TASK1_GUARD_TEST_FAIL_SETUP=1 bash scripts/test-task1-guards.sh
+assert_forced_restore transaction-child 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
+assert_forced_restore transaction-signal 143 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-signal-child
+assert_forced_restore setup-failure 74 'forced setup failure' \
+  env TASK1_GUARD_TEST_FAIL_SETUP=1 bash scripts/test-task1-guards.sh
+assert_forced_restore owned-lock-cleanup 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-owned-lock-child
+
+mkdir -p "$temporary/mv-wrapper"
+real_mv=$(command -v mv)
+cat > "$temporary/mv-wrapper/mv" <<EOF
+#!/usr/bin/env bash
+"$real_mv" "\$@"
+if [[ \${1:-} == .cache && ! -e "$temporary/post-move.reached" ]]; then
+  printf 'post-move reached\n' > "$temporary/post-move.reached"
+  kill -TERM "\$PPID"
+fi
+EOF
+chmod +x "$temporary/mv-wrapper/mv"
+assert_forced_restore post-move-signal 143 '' \
+  env PATH="$temporary/mv-wrapper:$PATH" bash scripts/test-task1-guards.sh --transaction-self-test-child
+test "$(cat "$temporary/post-move.reached")" = 'post-move reached'
+
+rm -rf .cache
+assert_forced_restore absent-cache 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
+test ! -e .cache && test ! -L .cache
+mkdir .cache
 
 rm -rf .cache
 mkdir -p "$temporary/outside-valid"
 printf 'outside sentinel\n' > "$temporary/outside-valid/sentinel"
 ln -s "$temporary/outside-valid" .cache
-assert_forced_restore valid-cache-symlink bash scripts/test-task1-guards.sh --transaction-self-test-child
+assert_forced_restore valid-cache-symlink 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
 test "$(cat "$temporary/outside-valid/sentinel")" = 'outside sentinel'
 rm .cache
 ln -s "$temporary/missing-cache-target" .cache
-assert_forced_restore broken-cache-symlink bash scripts/test-task1-guards.sh --transaction-self-test-child
+assert_forced_restore broken-cache-symlink 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
 rm .cache
+mkdir -p .cache "$temporary/outside-nested"
+printf 'outside nested sentinel\n' > "$temporary/outside-nested/sentinel"
+ln -s "$temporary/outside-nested" .cache/transaction-child
+state_fingerprint | sha256sum > "$temporary/nested-valid.before"
+find "$temporary/outside-nested" -printf '%y %m %s %p %l\n' -exec sha256sum {} \; 2>/dev/null | sha256sum \
+  >> "$temporary/nested-valid.before"
+assert_forced_restore nested-valid-cache-symlink 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
+state_fingerprint | sha256sum > "$temporary/nested-valid.after"
+find "$temporary/outside-nested" -printf '%y %m %s %p %l\n' -exec sha256sum {} \; 2>/dev/null | sha256sum \
+  >> "$temporary/nested-valid.after"
+diff -u "$temporary/nested-valid.before" "$temporary/nested-valid.after"
+rm -rf .cache
+mkdir -p .cache
+ln -s "$temporary/missing-nested-target" .cache/transaction-child
+assert_forced_restore nested-broken-cache-symlink 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
+rm -rf .cache
 mkdir -p .cache/.prepare-dbeaver-26.1.0.lock
-assert_forced_restore foreign-lock-transaction bash scripts/test-task1-guards.sh --transaction-self-test-child
+assert_forced_restore foreign-lock-transaction 73 'transaction mutation reached' \
+  bash scripts/test-task1-guards.sh --transaction-self-test-child
 test -d .cache/.prepare-dbeaver-26.1.0.lock
 rm -rf .cache
 mkdir .cache
@@ -644,8 +735,11 @@ for mutation in xz-test-iu xz-test-artifact jar-divergence index-order index-sym
   metadata-container extra-iu extra-artifact feature-group-edge feature-jar-edge junit-bundle-edge \
   junit-payload optional-group-edge redirected-mapping wrong-units-size wrong-artifacts-size \
   wrong-mappings-size unknown-root-child wrong-feature-artifact wrong-feature-self \
-  category-identity extra-bundle-edge feature-root feature-import feature-include feature-require \
-  unexpected-top-level; do
+  category-identity extra-bundle-edge missing-group-property required-properties-version \
+  required-properties-extra required-properties-remove requires-size provides-size \
+  extra-feature-capability artifact-ref-attribute artifact-properties-size feature-junit-payload \
+  bundle-require-capability feature-plugin-attribute feature-root feature-import feature-include \
+  feature-require unexpected-top-level; do
   cp -a "$repository" "$temporary/closed-p2-$mutation"
   python3 - "$temporary/closed-p2-$mutation" "$mutation" <<'PY'
 import lzma
@@ -714,17 +808,20 @@ elif mutation == "extra-artifact":
 elif mutation == "feature-group-edge":
     def add_edge(root):
         group = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.group"))
-        ET.SubElement(group.find("requires"), "required", {
+        requires = group.find("requires")
+        ET.SubElement(requires, "required", {
             "namespace": "org.eclipse.equinox.p2.iu", "name": "extra.iu", "range": "[1.0.0,1.0.0]"})
+        requires.set("size", str(len(requires)))
     both("content", add_edge)
 elif mutation == "feature-jar-edge":
     def add_feature_jar_edge(root):
         unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
         requires = unit.find("requires")
         if requires is None:
-            requires = ET.SubElement(unit, "requires")
+            requires = ET.SubElement(unit, "requires", {"size": "0"})
         ET.SubElement(requires, "required", {
             "namespace": "org.eclipse.equinox.p2.iu", "name": "extra.iu", "range": "[1.0.0,1.0.0]"})
+        requires.set("size", str(len(requires)))
     both("content", add_feature_jar_edge)
 elif mutation == "junit-bundle-edge":
     def add_junit_edge(root):
@@ -732,10 +829,11 @@ elif mutation == "junit-bundle-edge":
                     if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
         requires = unit.find("requires")
         if requires is None:
-            requires = ET.SubElement(unit, "requires")
+            requires = ET.SubElement(unit, "requires", {"size": "0"})
         ET.SubElement(requires, "required", {
             "namespace": "org.eclipse.equinox.p2.iu", "name": "junit-platform-engine",
             "range": "[1.13.4,1.13.4]"})
+        requires.set("size", str(len(requires)))
     both("content", add_junit_edge)
 elif mutation == "junit-payload":
     import hashlib
@@ -793,9 +891,111 @@ elif mutation == "extra-bundle-edge":
     def extra_bundle_edge(root):
         unit = next(unit for unit in root.findall("./units/unit")
                     if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
-        ET.SubElement(unit.find("requires"), "required", {
+        requires = unit.find("requires")
+        ET.SubElement(requires, "required", {
             "namespace": "osgi.bundle", "name": "org.example.extra", "range": "[1.0.0,2.0.0)"})
+        requires.set("size", str(len(requires)))
     both("content", extra_bundle_edge)
+elif mutation == "missing-group-property":
+    def remove_group_property(root):
+        group = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.group"))
+        props = group.find("properties")
+        props.remove(props.find("./property[@name='org.eclipse.equinox.p2.type.group']"))
+        props.set("size", str(len(props)))
+    both("content", remove_group_property)
+elif mutation.startswith("required-properties-"):
+    def mutate_required_properties(root):
+        unit = next(unit for unit in root.findall("./units/unit")
+                    if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
+        requires = unit.find("requires")
+        item = requires.find("requiredProperties")
+        if mutation == "required-properties-version":
+            item.set("match", "(&(osgi.ee=JavaSE)(version=17))")
+        elif mutation == "required-properties-remove":
+            requires.remove(item)
+            requires.set("size", str(len(requires)))
+        else:
+            import copy
+            requires.append(copy.deepcopy(item))
+            requires.set("size", str(len(requires)))
+    both("content", mutate_required_properties)
+elif mutation == "requires-size":
+    def wrong_requires_size(root):
+        unit = next(unit for unit in root.findall("./units/unit")
+                    if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
+        unit.find("requires").set("size", "999")
+    both("content", wrong_requires_size)
+elif mutation == "provides-size":
+    def wrong_provides_size(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        unit.find("provides").set("size", "999")
+    both("content", wrong_provides_size)
+elif mutation == "extra-feature-capability":
+    def extra_feature_capability(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        provides = unit.find("provides")
+        ET.SubElement(provides, "provided", {"namespace": "example", "name": "extra", "version": "1.0.0"})
+        provides.set("size", str(len(provides)))
+    both("content", extra_feature_capability)
+elif mutation == "artifact-ref-attribute":
+    def artifact_ref_attribute(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        unit.find("./artifacts/artifact").set("unknown", "true")
+    both("content", artifact_ref_attribute)
+elif mutation == "artifact-properties-size":
+    both("artifacts", lambda root: root.find("./artifacts/artifact/properties").set("size", "999"))
+elif mutation in {"feature-junit-payload", "bundle-require-capability"}:
+    import hashlib
+    if mutation == "feature-junit-payload":
+        packaged = next((repo / "features").glob("*.jar"))
+        classifier = "org.eclipse.update.feature"
+    else:
+        packaged = next((repo / "plugins").glob("*core*.jar"))
+        classifier = "osgi.bundle"
+    with zipfile.ZipFile(packaged) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    if mutation == "feature-junit-payload":
+        files["org/junit/JupiterInjected.class"] = b"injected"
+    else:
+        manifest = files["META-INF/MANIFEST.MF"].decode("utf-8")
+        files["META-INF/MANIFEST.MF"] = (manifest.rstrip() + "\nRequire-Capability: org.junit.jupiter\n").encode()
+    temporary = packaged.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, packaged)
+    def update_payload_hashes(root):
+        artifact = next(item for item in root.findall("./artifacts/artifact")
+                        if item.attrib.get("classifier") == classifier and item.attrib.get("id") in packaged.name)
+        values = {item.attrib["name"]: item for item in artifact.findall("./properties/property")}
+        data = packaged.read_bytes()
+        values["artifact.size"].set("value", str(len(data)))
+        values["download.size"].set("value", str(len(data)))
+        values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
+        values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
+    both("artifacts", update_payload_hashes)
+elif mutation == "feature-plugin-attribute":
+    feature = next((repo / "features").glob("*.jar"))
+    with zipfile.ZipFile(feature) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    root = ET.fromstring(files["feature.xml"])
+    root.find("plugin").set("fragment", "true")
+    files["feature.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    temporary = feature.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, feature)
+    import hashlib
+    def update_feature_plugin_hashes(root):
+        artifact = root.find("./artifacts/artifact[@classifier='org.eclipse.update.feature']")
+        values = {item.attrib["name"]: item for item in artifact.findall("./properties/property")}
+        data = feature.read_bytes()
+        values["artifact.size"].set("value", str(len(data)))
+        values["download.size"].set("value", str(len(data)))
+        values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
+        values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
+    both("artifacts", update_feature_plugin_hashes)
 elif mutation == "feature-root":
     feature = next((repo / "features").glob("*.jar"))
     with zipfile.ZipFile(feature) as archive:
@@ -845,8 +1045,22 @@ PY
     unknown-root-child) rg -q 'unexpected content metadata root children' "$temporary/closed-p2-$mutation.out" ;;
     wrong-feature-artifact) rg -q 'incorrect artifact reference on feature.jar' "$temporary/closed-p2-$mutation.out" ;;
     wrong-feature-self) rg -q 'incorrect feature.jar self capability' "$temporary/closed-p2-$mutation.out" ;;
-    category-identity) rg -q 'incorrect category self capability' "$temporary/closed-p2-$mutation.out" ;;
+    category-identity) rg -q 'unexpected category capabilities' "$temporary/closed-p2-$mutation.out" ;;
     extra-bundle-edge) rg -q 'unexpected .* bundle requirements' "$temporary/closed-p2-$mutation.out" ;;
+    missing-group-property) rg -q 'missing or invalid feature.group role property' "$temporary/closed-p2-$mutation.out" ;;
+    required-properties-version) rg -q 'invalid JavaSE-21 requiredProperties' "$temporary/closed-p2-$mutation.out" ;;
+    required-properties-extra) rg -q 'missing JavaSE-21 requiredProperties' "$temporary/closed-p2-$mutation.out" ;;
+    required-properties-remove) rg -q 'missing JavaSE-21 requiredProperties' "$temporary/closed-p2-$mutation.out" ;;
+    requires-size) rg -q 'incorrect .* requires size attribute' "$temporary/closed-p2-$mutation.out" ;;
+    provides-size) rg -q 'incorrect feature.jar provides size attribute' "$temporary/closed-p2-$mutation.out" ;;
+    extra-feature-capability) rg -q 'unexpected feature.jar capabilities' "$temporary/closed-p2-$mutation.out" ;;
+    artifact-ref-attribute) rg -q 'incorrect artifact reference on feature.jar' "$temporary/closed-p2-$mutation.out" ;;
+    artifact-properties-size) rg -q 'incorrect artifact .* properties size attribute' "$temporary/closed-p2-$mutation.out" ;;
+    feature-junit-payload) rg -q 'test/JUnit marker in packaged feature payload' "$temporary/closed-p2-$mutation.out" ;;
+    bundle-require-capability) rg -q 'test/JUnit marker in production bundle payload or manifest' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    feature-plugin-attribute) rg -q 'packaged feature plugin identities or structure differ' \
+      "$temporary/closed-p2-$mutation.out" ;;
   esac
 done
 
