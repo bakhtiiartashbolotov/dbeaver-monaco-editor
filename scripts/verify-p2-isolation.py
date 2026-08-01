@@ -97,6 +97,13 @@ def main() -> None:
     entries = {entry.name for entry in repository.iterdir()}
     if entries != TOP_LEVEL:
         fail(f"unexpected repository top-level entries: {sorted(entries ^ TOP_LEVEL)}")
+    for name in TOP_LEVEL:
+        entry = repository / name
+        expected_directory = name in {"features", "plugins"}
+        mode = entry.lstat().st_mode
+        if entry.is_symlink() or (expected_directory and not stat.S_ISDIR(mode)) \
+                or (not expected_directory and not stat.S_ISREG(mode)):
+            fail(f"unexpected repository entry type: {name}")
 
     index_lines = [line for line in (repository / "p2.index").read_text(encoding="utf-8").splitlines()
                    if line and not line.startswith("#")]
@@ -110,6 +117,16 @@ def main() -> None:
 
     artifacts = ET.fromstring(metadata_bytes(repository, "artifacts"))
     content = ET.fromstring(metadata_bytes(repository, "content"))
+    if (artifacts.tag != "repository"
+            or artifacts.attrib.get("type") != "org.eclipse.equinox.p2.artifact.repository.simpleRepository"
+            or artifacts.attrib.get("version") != "1"
+            or len(artifacts.findall("artifacts")) != 1):
+        fail("invalid artifacts metadata root or container structure")
+    if (content.tag != "repository"
+            or content.attrib.get("type") != "org.eclipse.equinox.internal.p2.metadata.repository.LocalMetadataRepository"
+            or content.attrib.get("version") != "1"
+            or len(content.findall("units")) != 1):
+        fail("invalid content metadata root or container structure")
 
     plugin_jars = closed_jars(repository / "plugins", "plugins")
     plugin_identities = [manifest_identity(bundle) for bundle in plugin_jars]
@@ -128,6 +145,8 @@ def main() -> None:
     except (KeyError, ET.ParseError, zipfile.BadZipFile) as error:
         fail(f"invalid packaged feature: {error}")
     allowed_feature_children = {"description", "copyright", "license", "plugin"}
+    if feature_xml.tag != "feature" or feature_xml.attrib.get("id") != FEATURE:
+        fail("invalid packaged feature root or ID")
     if any(child.tag not in allowed_feature_children for child in feature_xml):
         fail("packaged feature contains include/import/require or unknown structure")
     plugins = feature_xml.findall("plugin")
@@ -135,6 +154,8 @@ def main() -> None:
     if len(plugins) != 4 or feature_identities != identities or any(list(item) for item in plugins):
         fail("packaged feature plugin identities or structure differ")
     feature_version = feature_xml.attrib.get("version", "")
+    if not feature_version:
+        fail("packaged feature version is empty")
 
     artifact_elements = artifacts.findall("./artifacts/artifact")
     artifact_roles = [(item.attrib.get("classifier", ""), item.attrib.get("id", ""), item.attrib.get("version", ""))
@@ -143,6 +164,8 @@ def main() -> None:
     expected_artifact_roles.add(("org.eclipse.update.feature", FEATURE, feature_version))
     if len(artifact_roles) != 5 or set(artifact_roles) != expected_artifact_roles:
         fail(f"unexpected artifact universe: {artifact_roles}")
+    if any(any(marker in " ".join(role).lower() for marker in TEST_MARKERS) for role in artifact_roles):
+        fail("test-only artifact metadata")
     for element, (classifier, identifier, version) in zip(artifact_elements, artifact_roles):
         jar = (repository / "plugins" / f"{identifier}_{version}.jar" if classifier == "osgi.bundle"
                else repository / "features" / f"{identifier}_{version}.jar")
@@ -161,6 +184,14 @@ def main() -> None:
     unit_map = {unit.attrib.get("id", ""): unit for unit in units}
     if len(units) != 8 or len(unit_map) != 8:
         fail(f"expected exactly eight unique IUs, found {len(units)}")
+    for unit in units:
+        metadata_names = [unit.attrib.get("id", "")]
+        metadata_names.extend(item.attrib.get("name", "") for item in unit.findall("./provides/provided"))
+        metadata_names.extend(item.attrib.get("name", "") for item in unit.findall("./requires/required"))
+        metadata_names.extend(item.attrib.get("namespace", "") for item in unit.findall("./provides/provided"))
+        metadata_names.extend(item.attrib.get("namespace", "") for item in unit.findall("./requires/required"))
+        if any(marker in value.lower() for value in metadata_names for marker in TEST_MARKERS):
+            fail(f"test-only IU metadata: {unit.attrib.get('id', '')}")
     bundle_ids = {name for name, _ in identities}
     feature_jar_id = f"{FEATURE}.feature.jar"
     feature_group_id = f"{FEATURE}.feature.group"
@@ -189,6 +220,8 @@ def main() -> None:
 
     if unit_map[feature_jar_id].attrib.get("version") != feature_version:
         fail("feature.jar IU version mismatch")
+    if unit_map[feature_jar_id].findall("./requires/required"):
+        fail("feature.jar IU must have no direct requirements")
     group = unit_map[feature_group_id]
     if group.attrib.get("version") != feature_version:
         fail("feature.group IU version mismatch")

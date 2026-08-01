@@ -4,24 +4,81 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$repo_root"
 temporary=$(mktemp -d)
-cache_backup=''
 foreign_lock=''
-cp mvnw "$temporary/mvnw.original"
-cp releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256 "$temporary/checksum.original"
+suite_cache_backup=$temporary/cache.original
+had_cache=false
+for tracked in mvnw .mvn/wrapper/maven-wrapper.properties \
+  releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256; do
+  mkdir -p "$temporary/tracked/$(dirname "$tracked")"
+  cp -p "$tracked" "$temporary/tracked/$tracked"
+done
+if [[ -e .cache || -L .cache ]]; then
+  had_cache=true
+  mv .cache "$suite_cache_backup"
+  cp -a "$suite_cache_backup" .cache
+fi
 
 cleanup() {
-  cp "$temporary/mvnw.original" mvnw 2>/dev/null || true
-  chmod +x mvnw 2>/dev/null || true
-  cp "$temporary/checksum.original" \
-    releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256 2>/dev/null || true
-  if [[ -n "$cache_backup" && -e "$cache_backup" ]]; then
-    rm -rf .cache
-    mv "$cache_backup" .cache
-  fi
+  for tracked in mvnw .mvn/wrapper/maven-wrapper.properties \
+    releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256; do
+    cp -p "$temporary/tracked/$tracked" "$tracked" 2>/dev/null || true
+  done
+  rm -rf .cache 2>/dev/null || true
+  [[ "$had_cache" != true || ! -e "$suite_cache_backup" ]] || mv "$suite_cache_backup" .cache
   [[ -z "$foreign_lock" || ! -d "$foreign_lock" ]] || rmdir "$foreign_lock"
   rm -rf "$temporary"
 }
 trap cleanup EXIT
+
+if [[ ${1:-} == --transaction-self-test-child ]]; then
+  chmod 0600 mvnw
+  printf '\nmutated\n' >> .mvn/wrapper/maven-wrapper.properties
+  printf '\nmutated\n' >> releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256
+  [[ ! -f .cache/dbeaver-26.1.0/dbeaver/dbeaver.ini ]] || \
+    printf '\nmutated\n' >> .cache/dbeaver-26.1.0/dbeaver/dbeaver.ini
+  exit 73
+elif [[ $# -ne 0 ]]; then
+  echo 'unsupported guard-suite argument' >&2
+  exit 2
+fi
+
+state_fingerprint() {
+  python3 - <<'PY'
+import hashlib
+from pathlib import Path
+import stat
+for root in (Path("mvnw"), Path(".mvn/wrapper/maven-wrapper.properties"),
+             Path("releng/baseline/dbeaver-ce-26.1.0-linux-x86_64.tar.gz.sha256"), Path(".cache")):
+    if not root.exists() and not root.is_symlink():
+        print(root.as_posix(), "missing")
+        continue
+    paths = [root] if not root.is_dir() else [root, *sorted(root.rglob("*"))]
+    for path in paths:
+        status = path.lstat()
+        value = [path.as_posix(), oct(stat.S_IMODE(status.st_mode)), str(stat.S_IFMT(status.st_mode))]
+        if stat.S_ISREG(status.st_mode):
+            value.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        elif stat.S_ISLNK(status.st_mode):
+            value.append(path.readlink().as_posix())
+        print("\0".join(value))
+PY
+}
+
+state_fingerprint | sha256sum > "$temporary/self-test.before"
+git diff --binary | sha256sum >> "$temporary/self-test.before"
+git status --porcelain=v1 >> "$temporary/self-test.before"
+mkdir "$temporary/outside-self-test"
+printf 'outside sentinel\n' > "$temporary/outside-self-test/sentinel"
+if bash scripts/test-task1-guards.sh --transaction-self-test-child; then
+  echo 'transaction self-test child unexpectedly succeeded' >&2
+  exit 1
+fi
+state_fingerprint | sha256sum > "$temporary/self-test.after"
+git diff --binary | sha256sum >> "$temporary/self-test.after"
+git status --porcelain=v1 >> "$temporary/self-test.after"
+diff -u "$temporary/self-test.before" "$temporary/self-test.after"
+test "$(cat "$temporary/outside-self-test/sentinel")" = 'outside sentinel'
+echo 'negative guard passed: forced exit restored tracked files, modes, cache, sentinel, and git state'
 
 expect_failure() {
   local label=$1
@@ -66,17 +123,22 @@ regular_mode=$(stat -c '%a' "$regular")
 directory=$install/plugins
 directory_mode=$(stat -c '%a' "$directory")
 root_mode=$(stat -c '%a' "$install")
-chmod 0644 "$install/dbeaver" "$install/jre/bin/java"
-chmod 0600 "$regular"
-chmod 0700 "$directory" "$install"
-expect_failure installed-mode-drift python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
-bash scripts/prepare-dbeaver-target.sh >"$temporary/mode-repair.out"
-test "$(stat -c '%a' "$install/dbeaver")" = "$launcher_mode"
-test "$(stat -c '%a' "$install/jre/bin/java")" = "$jre_mode"
-test "$(stat -c '%a' "$regular")" = "$regular_mode"
-test "$(stat -c '%a' "$directory")" = "$directory_mode"
-test "$(stat -c '%a' "$install")" = "$root_mode"
-echo 'negative guard passed: launcher, JRE, regular-file, directory, and root modes repaired'
+for mode_case in \
+  "launcher|$install/dbeaver|dbeaver|$launcher_mode|0644" \
+  "jre|$install/jre/bin/java|jre/bin/java|$jre_mode|0644" \
+  "regular|$regular|configuration/config.ini|$regular_mode|0600" \
+  "directory|$directory|plugins|$directory_mode|0700" \
+  "root|$install|<root>|$root_mode|0700"; do
+  IFS='|' read -r label path relative expected_mode drift_mode <<< "$mode_case"
+  chmod "$drift_mode" "$path"
+  expect_failure "installed-mode-$label" \
+    python3 scripts/verify-dbeaver-tree.py "$archive" "$install" "$digest"
+  rg -q "mode mismatch: path=$relative expected=0*$expected_mode actual=0*$drift_mode" \
+    "$temporary/installed-mode-$label.out"
+  bash scripts/prepare-dbeaver-target.sh >"$temporary/mode-repair-$label.out"
+  test "$(stat -c '%a' "$path")" = "$expected_mode"
+  echo "negative guard passed: $label mode drift repaired independently"
+done
 
 (
   trap 'chmod "$launcher_mode" "$install/dbeaver"' EXIT
@@ -200,6 +262,7 @@ def archive(name, entries):
 archive("duplicate-root.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/", "dir", b""),
                                   ("dbeaver/a", "file", b"a")])
 archive("missing-root.tar.gz", [("dbeaver/a", "file", b"a")])
+archive("empty-root.tar.gz", [("dbeaver/", "dir", b"")])
 archive("unsafe-late.tar.gz", [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a"),
                                ("dbeaver/link", "symlink", b"")])
 base = [("dbeaver/", "dir", b""), ("dbeaver/a", "file", b"a")]
@@ -234,7 +297,7 @@ payload[148:156] = f"{sum(payload[:512]):06o}\0 ".encode("ascii")
 with gzip.open(root_alias, "wb") as target:
     target.write(payload)
 PY
-for fixture in duplicate-root missing-root unsafe-late file-slash file-slash-collision root-file-slash \
+for fixture in duplicate-root missing-root empty-root unsafe-late file-slash file-slash-collision root-file-slash \
   root-no-slash hardlink special absolute traversal \
   duplicate-path contiguous missing-parent file-ancestor-first file-ancestor-last identity-collision; do
   destination=$temporary/$fixture-output
@@ -322,15 +385,15 @@ test -z "$(find .cache -maxdepth 1 \( -name '.dbeaver-*.staging.*' -o -name '.db
 echo 'negative guard passed: failed publication restored previous installation'
 bash scripts/prepare-dbeaver-target.sh >/dev/null
 
-find .cache/dbeaver-26.1.0 -printf '%P %s %T@\n' | sort | sha256sum > "$temporary/tree-before"
+find .cache/dbeaver-26.1.0 -printf '%P %m %s %T@\n' | sort | sha256sum > "$temporary/tree-before"
 bash scripts/prepare-dbeaver-target.sh >"$temporary/reuse.out"
-find .cache/dbeaver-26.1.0 -printf '%P %s %T@\n' | sort | sha256sum > "$temporary/tree-after"
+find .cache/dbeaver-26.1.0 -printf '%P %m %s %T@\n' | sort | sha256sum > "$temporary/tree-after"
 diff -u "$temporary/tree-before" "$temporary/tree-after"
 rg -q 'reusing exact verified installation' "$temporary/reuse.out"
 echo 'positive guard passed: clean installation reused without mutation'
 
-cache_backup=$temporary/cache-backup
-mv .cache "$cache_backup"
+cache_escape_backup=$temporary/cache-escape-backup
+mv .cache "$cache_escape_backup"
 mkdir "$temporary/outside-cache"
 printf 'outside sentinel\n' > "$temporary/outside-cache/sentinel"
 ln -s "$temporary/outside-cache" .cache
@@ -338,8 +401,7 @@ expect_failure cache-symlink-escape bash scripts/prepare-dbeaver-target.sh
 test "$(cat "$temporary/outside-cache/sentinel")" = 'outside sentinel'
 test "$(find "$temporary/outside-cache" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
 rm .cache
-mv "$cache_backup" .cache
-cache_backup=''
+mv "$cache_escape_backup" .cache
 echo 'negative guard passed: cache symlink escape preserved outside sentinel'
 
 for escape in downloads installation archive; do (
@@ -442,6 +504,7 @@ expect_failure exploded-test-plugin bash scripts/verify-test-target.sh "$tempora
 cp -a "$repository" "$temporary/feature-repository"
 python3 - "$temporary/feature-repository" <<'PY'
 import os
+import lzma
 from pathlib import Path
 import sys
 import tempfile
@@ -465,6 +528,7 @@ expect_failure packaged-feature-test-plugin bash scripts/verify-test-target.sh "
 for mutation in feature-version artifact-version unit-version capability-version capability-duplicate; do
   cp -a "$repository" "$temporary/p2-$mutation"
   python3 - "$temporary/p2-$mutation" "$mutation" <<'PY'
+import lzma
 import os
 from pathlib import Path
 import sys
@@ -485,12 +549,20 @@ def rewrite(path, member, mutate):
             target.writestr(name, data)
     os.replace(replacement, path)
 
+def rewrite_metadata(base, mutate):
+    xz_path = repo / f"{base}.xml.xz"
+    xz_root = ET.fromstring(lzma.decompress(xz_path.read_bytes()))
+    mutate(xz_root)
+    data = ET.tostring(xz_root, encoding="utf-8", xml_declaration=True)
+    xz_path.write_bytes(lzma.compress(data))
+    rewrite(repo / f"{base}.jar", f"{base}.xml", mutate)
+
 if mutation == "feature-version":
     feature = next((repo / "features").glob("*.jar"))
     rewrite(feature, "feature.xml", lambda root: root.findall("plugin")[0].set("version", "9.9.9"))
 elif mutation == "artifact-version":
-    rewrite(repo / "artifacts.jar", "artifacts.xml",
-            lambda root: root.find("./artifacts/artifact[@classifier='osgi.bundle']").set("version", "9.9.9"))
+    rewrite_metadata("artifacts",
+                     lambda root: root.find("./artifacts/artifact[@classifier='osgi.bundle']").set("version", "9.9.9"))
 else:
     def content_change(root):
         unit = next(unit for unit in root.findall("./units/unit")
@@ -503,14 +575,15 @@ else:
         else:
             import copy
             unit.find("provides").append(copy.deepcopy(capability))
-    rewrite(repo / "content.jar", "content.xml", content_change)
+    rewrite_metadata("content", content_change)
 PY
   expect_failure "p2-$mutation" bash scripts/verify-test-target.sh \
     "$temporary/p2-$mutation" "$production_target" "$test_target"
 done
 
-for mutation in xz-test-iu xz-test-artifact jar-divergence index-order extra-iu extra-artifact \
-  feature-group-edge feature-import feature-include feature-require unexpected-top-level; do
+for mutation in xz-test-iu xz-test-artifact jar-divergence index-order index-symlink metadata-root \
+  metadata-container extra-iu extra-artifact feature-group-edge feature-jar-edge junit-bundle-edge \
+  feature-root feature-import feature-include feature-require unexpected-top-level; do
   cp -a "$repository" "$temporary/closed-p2-$mutation"
   python3 - "$temporary/closed-p2-$mutation" "$mutation" <<'PY'
 import lzma
@@ -562,6 +635,15 @@ elif mutation == "index-order":
     (repo / "p2.index").write_text(
         "version=1\nmetadata.repository.factory.order=content.xml.xz,content.xml,\\!\n"
         "artifact.repository.factory.order=artifacts.xml.xz,artifacts.xml,\\!\n", encoding="utf-8")
+elif mutation == "index-symlink":
+    real_index = repo.parent / f"{repo.name}.index-real"
+    real_index.write_bytes((repo / "p2.index").read_bytes())
+    (repo / "p2.index").unlink()
+    (repo / "p2.index").symlink_to(f"../{real_index.name}")
+elif mutation == "metadata-root":
+    both("artifacts", lambda root: setattr(root, "tag", "invalid"))
+elif mutation == "metadata-container":
+    both("content", lambda root: ET.SubElement(root, "units"))
 elif mutation == "extra-iu":
     both("content", lambda root: ET.SubElement(root.find("units"), "unit", {"id": "extra.iu", "version": "1.0.0"}))
 elif mutation == "extra-artifact":
@@ -573,6 +655,48 @@ elif mutation == "feature-group-edge":
         ET.SubElement(group.find("requires"), "required", {
             "namespace": "org.eclipse.equinox.p2.iu", "name": "extra.iu", "range": "[1.0.0,1.0.0]"})
     both("content", add_edge)
+elif mutation == "feature-jar-edge":
+    def add_feature_jar_edge(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        requires = unit.find("requires")
+        if requires is None:
+            requires = ET.SubElement(unit, "requires")
+        ET.SubElement(requires, "required", {
+            "namespace": "org.eclipse.equinox.p2.iu", "name": "extra.iu", "range": "[1.0.0,1.0.0]"})
+    both("content", add_feature_jar_edge)
+elif mutation == "junit-bundle-edge":
+    def add_junit_edge(root):
+        unit = next(unit for unit in root.findall("./units/unit")
+                    if unit.find("./provides/provided[@namespace='osgi.bundle']") is not None)
+        requires = unit.find("requires")
+        if requires is None:
+            requires = ET.SubElement(unit, "requires")
+        ET.SubElement(requires, "required", {
+            "namespace": "org.eclipse.equinox.p2.iu", "name": "junit-platform-engine",
+            "range": "[1.13.4,1.13.4]"})
+    both("content", add_junit_edge)
+elif mutation == "feature-root":
+    feature = next((repo / "features").glob("*.jar"))
+    with zipfile.ZipFile(feature) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    root = ET.fromstring(files["feature.xml"])
+    root.tag = "invalid"
+    files["feature.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    temporary = feature.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, feature)
+    import hashlib
+    def update_feature_hashes(root):
+        artifact = root.find("./artifacts/artifact[@classifier='org.eclipse.update.feature']")
+        values = {item.attrib["name"]: item for item in artifact.findall("./properties/property")}
+        data = feature.read_bytes()
+        values["artifact.size"].set("value", str(len(data)))
+        values["download.size"].set("value", str(len(data)))
+        values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
+        values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
+    both("artifacts", update_feature_hashes)
 elif mutation.startswith("feature-"):
     feature = next((repo / "features").glob("*.jar"))
     with zipfile.ZipFile(feature) as archive:

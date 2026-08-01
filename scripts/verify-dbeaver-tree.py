@@ -121,7 +121,7 @@ def validated_members(
     root = records.get("dbeaver")
     if root is None or root[0] != "directory":
         fail("archive must contain exactly one explicit canonical dbeaver/ directory")
-    if not expected:
+    if len(expected) == 1:
         fail("archive contains no DBeaver entries")
     for canonical in records:
         if canonical == "dbeaver":
@@ -243,7 +243,14 @@ def main() -> None:
         missing = sorted(expected.keys() - actual.keys())
         extra = sorted(actual.keys() - expected.keys())
         changed = sorted(path for path in expected.keys() & actual.keys() if expected[path] != actual[path])
-        fail(f"installation tree mismatch; missing={missing[:3]}, extra={extra[:3]}, changed={changed[:3]}")
+        mode_changes = []
+        for path in changed:
+            expected_entry, actual_entry = expected[path], actual[path]
+            if expected_entry[0] == actual_entry[0] and expected_entry[1] != actual_entry[1]:
+                mode_changes.append(
+                    f"path={path or '<root>'} expected={expected_entry[1]:04o} actual={actual_entry[1]:04o}")
+        detail = f", mode mismatch: {mode_changes[0]}" if mode_changes else ""
+        fail(f"installation tree mismatch; missing={missing[:3]}, extra={extra[:3]}, changed={changed[:3]}{detail}")
     action = "extracted" if extract else "verified"
     print(f"{action} exact DBeaver installation tree: {len(actual)} entries")
 
