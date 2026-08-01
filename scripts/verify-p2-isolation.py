@@ -42,6 +42,7 @@ def manifest_identity(bundle: Path) -> tuple[str, str]:
     try:
         with zipfile.ZipFile(bundle) as archive:
             text = archive.read("META-INF/MANIFEST.MF").decode("utf-8")
+            payload_names = archive.namelist()
     except (KeyError, UnicodeDecodeError, zipfile.BadZipFile) as error:
         fail(f"unreadable bundle manifest: {bundle}: {error}")
     logical = []
@@ -55,6 +56,10 @@ def manifest_identity(bundle: Path) -> tuple[str, str]:
         if len(values) != 1:
             fail(f"bundle does not have exactly one readable {name}: {bundle}")
         return values[0]
+    public_metadata = "\n".join(
+        line for line in logical if line.startswith(("Import-Package:", "Require-Bundle:", "Export-Package:")))
+    if any(marker in value.lower() for value in [*payload_names, public_metadata] for marker in TEST_MARKERS):
+        fail(f"test/JUnit marker in production bundle payload or manifest: {bundle.name}")
     return header("Bundle-SymbolicName").split(";", 1)[0], header("Bundle-Version")
 
 
@@ -86,6 +91,57 @@ def properties(element: ET.Element) -> dict[str, str]:
 
 def exact_range(version: str) -> str:
     return f"[{version},{version}]"
+
+
+def require_size(container: ET.Element, children: list[ET.Element], label: str) -> None:
+    if container.attrib != {"size": str(len(children))}:
+        fail(f"incorrect {label} size attribute")
+
+
+def exact_elements(parent: ET.Element, tags: list[str], label: str) -> None:
+    if [child.tag for child in parent] != tags:
+        fail(f"unexpected {label} root children")
+
+
+def exact_artifact_reference(unit: ET.Element, expected: tuple[str, str, str] | None, label: str) -> None:
+    containers = unit.findall("artifacts")
+    if expected is None:
+        if containers:
+            fail(f"unexpected artifact reference on {label}")
+        return
+    if len(containers) != 1:
+        fail(f"missing artifact reference on {label}")
+    refs = containers[0].findall("artifact")
+    require_size(containers[0], refs, f"{label} artifacts")
+    actual = [(item.attrib.get("classifier"), item.attrib.get("id"), item.attrib.get("version")) for item in refs]
+    if actual != [expected] or any(list(item) for item in refs):
+        fail(f"incorrect artifact reference on {label}")
+
+
+def exact_capability(unit: ET.Element, expected: tuple[str, str, str], label: str) -> None:
+    matches = [item for item in unit.findall("./provides/provided")
+               if item.attrib.get("namespace") == expected[0]]
+    if len(matches) != 1 or tuple(matches[0].attrib.get(key, "")
+            for key in ("namespace", "name", "version")) != expected or len(matches[0].attrib) != 3:
+        fail(f"incorrect {label} capability")
+
+
+def exact_requirements(unit: ET.Element, expected: set[tuple[tuple[str, str], ...]], label: str,
+                       filters: dict[str, str] | None = None) -> None:
+    requirements = unit.findall("./requires/required")
+    actual = {tuple(sorted(item.attrib.items())) for item in requirements}
+    structure_ok = True
+    for item in requirements:
+        children = list(item)
+        expected_filter = (filters or {}).get(item.attrib.get("name", ""))
+        if expected_filter is not None:
+            structure_ok = (structure_ok and len(children) == 1 and children[0].tag == "filter"
+                            and (children[0].text or "").strip() == expected_filter
+                            and not list(children[0]))
+        elif children:
+            structure_ok = False
+    if len(requirements) != len(expected) or actual != expected or not structure_ok:
+        fail(f"unexpected {label} requirements: actual={actual} expected={expected}")
 
 
 def main() -> None:
@@ -127,6 +183,27 @@ def main() -> None:
             or content.attrib.get("version") != "1"
             or len(content.findall("units")) != 1):
         fail("invalid content metadata root or container structure")
+    exact_elements(artifacts, ["properties", "mappings", "artifacts"], "artifacts metadata")
+    exact_elements(content, ["properties", "units"], "content metadata")
+    artifact_properties = artifacts.find("properties")
+    mappings = artifacts.find("mappings")
+    artifact_container = artifacts.find("artifacts")
+    content_properties = content.find("properties")
+    unit_container = content.find("units")
+    assert artifact_properties is not None and mappings is not None and artifact_container is not None
+    assert content_properties is not None and unit_container is not None
+    require_size(artifact_properties, artifact_properties.findall("property"), "artifact properties")
+    require_size(content_properties, content_properties.findall("property"), "content properties")
+    mapping_rules = mappings.findall("rule")
+    require_size(mappings, mapping_rules, "mappings")
+    expected_mappings = [
+        {"filter": "(& (classifier=osgi.bundle))", "output": "${repoUrl}/plugins/${id}_${version}.jar"},
+        {"filter": "(& (classifier=binary))", "output": "${repoUrl}/binary/${id}_${version}"},
+        {"filter": "(& (classifier=org.eclipse.update.feature))",
+         "output": "${repoUrl}/features/${id}_${version}.jar"},
+    ]
+    if [item.attrib for item in mapping_rules] != expected_mappings or any(list(item) for item in mapping_rules):
+        fail("unexpected artifact mapping rules")
 
     plugin_jars = closed_jars(repository / "plugins", "plugins")
     plugin_identities = [manifest_identity(bundle) for bundle in plugin_jars]
@@ -158,6 +235,7 @@ def main() -> None:
         fail("packaged feature version is empty")
 
     artifact_elements = artifacts.findall("./artifacts/artifact")
+    require_size(artifact_container, artifact_elements, "artifacts")
     artifact_roles = [(item.attrib.get("classifier", ""), item.attrib.get("id", ""), item.attrib.get("version", ""))
                       for item in artifact_elements]
     expected_artifact_roles = {("osgi.bundle", name, version) for name, version in identities}
@@ -181,6 +259,7 @@ def main() -> None:
             fail(f"incorrect SHA-512: {identifier}")
 
     units = content.findall("./units/unit")
+    require_size(unit_container, units, "units")
     unit_map = {unit.attrib.get("id", ""): unit for unit in units}
     if len(units) != 8 or len(unit_map) != 8:
         fail(f"expected exactly eight unique IUs, found {len(units)}")
@@ -217,27 +296,64 @@ def main() -> None:
         for capability in bundle_caps + identity_caps:
             if (capability.attrib.get("name"), capability.attrib.get("version")) != (identifier, version):
                 fail(f"invalid bundle capability identity: {identifier}")
+        exact_artifact_reference(unit, ("osgi.bundle", identifier, version), identifier)
+        exact_capability(unit, ("osgi.identity", identifier, version), f"{identifier} identity")
+        exact_capability(unit, ("org.eclipse.equinox.p2.eclipse.type", "bundle", "1.0.0"),
+                         f"{identifier} type")
+        source_edge = tuple(sorted({
+            "namespace": "org.eclipse.equinox.p2.iu",
+            "name": f"{identifier}.source",
+            "range": exact_range(version),
+            "optional": "true",
+        }.items()))
+        expected_bundle_edges = {source_edge}
+        if identifier.endswith(".ui"):
+            expected_bundle_edges.add(tuple(sorted({
+                "namespace": "osgi.bundle",
+                "name": "org.jkiss.dbeaver.ui.editors.sql",
+                "range": "[1.0.180,2.0.0)",
+            }.items())))
+        exact_requirements(unit, expected_bundle_edges, f"{identifier} bundle",
+                           {f"{identifier}.source": "(org.eclipse.update.install.sources=true)"})
 
-    if unit_map[feature_jar_id].attrib.get("version") != feature_version:
+    feature_jar = unit_map[feature_jar_id]
+    if feature_jar.attrib.get("version") != feature_version:
         fail("feature.jar IU version mismatch")
-    if unit_map[feature_jar_id].findall("./requires/required"):
-        fail("feature.jar IU must have no direct requirements")
+    exact_artifact_reference(feature_jar, ("org.eclipse.update.feature", FEATURE, feature_version), "feature.jar")
+    exact_capability(feature_jar, ("org.eclipse.equinox.p2.iu", feature_jar_id, feature_version),
+                     "feature.jar self")
+    exact_capability(feature_jar, ("org.eclipse.equinox.p2.eclipse.type", "feature", "1.0.0"),
+                     "feature.jar type")
+    exact_capability(feature_jar, ("org.eclipse.update.feature", FEATURE, feature_version),
+                     "feature.jar update-feature")
+    exact_requirements(feature_jar, set(), "feature.jar")
     group = unit_map[feature_group_id]
     if group.attrib.get("version") != feature_version:
         fail("feature.group IU version mismatch")
-    requirements = group.findall("./requires/required")
-    required_edges = {(item.attrib.get("namespace"), item.attrib.get("name"), item.attrib.get("range"))
-                      for item in requirements}
-    expected_edges = {("org.eclipse.equinox.p2.iu", name, exact_range(version)) for name, version in identities}
-    expected_edges.add(("org.eclipse.equinox.p2.iu", feature_jar_id, exact_range(feature_version)))
-    if len(requirements) != 5 or required_edges != expected_edges:
-        fail(f"unexpected feature.group requirements: {required_edges ^ expected_edges}")
+    exact_artifact_reference(group, None, "feature.group")
+    exact_capability(group, ("org.eclipse.equinox.p2.iu", feature_group_id, feature_version),
+                     "feature.group self")
+    expected_edges = {tuple(sorted({"namespace": "org.eclipse.equinox.p2.iu", "name": name,
+                                    "range": exact_range(version)}.items())) for name, version in identities}
+    expected_edges.add(tuple(sorted({"namespace": "org.eclipse.equinox.p2.iu", "name": feature_jar_id,
+                                     "range": exact_range(feature_version)}.items())))
+    exact_requirements(group, expected_edges, "feature.group",
+                       {feature_jar_id: "(org.eclipse.update.install.features=true)"})
 
-    category_requirements = category.findall("./requires/required")
-    category_edge = ("org.eclipse.equinox.p2.iu", feature_group_id, exact_range(feature_version))
-    if len(category_requirements) != 1 or tuple(category_requirements[0].attrib.get(name, "")
-            for name in ("namespace", "name", "range")) != category_edge:
-        fail("category does not require exactly the generated feature group")
+    category_id = category.attrib.get("id", "")
+    category_version = category.attrib.get("version", "")
+    if not category_id or not category_version:
+        fail("invalid category identity")
+    exact_artifact_reference(category, None, "category")
+    exact_capability(category, ("org.eclipse.equinox.p2.iu", category_id, category_version), "category self")
+    category_edge = {tuple(sorted({"namespace": "org.eclipse.equinox.p2.iu", "name": feature_group_id,
+                                   "range": exact_range(feature_version)}.items()))}
+    exact_requirements(category, category_edge, "category")
+
+    jre = unit_map["a.jre.javase"]
+    exact_artifact_reference(jre, None, "a.jre.javase")
+    exact_capability(jre, ("org.eclipse.equinox.p2.iu", "a.jre.javase", "21.0.0"), "Java self")
+    exact_requirements(jre, set(), "Java execution environment")
     print("production p2 repository topology, representations, artifacts, hashes, and IUs are exact")
 
 
