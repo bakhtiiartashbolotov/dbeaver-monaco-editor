@@ -418,13 +418,15 @@ untested dependency graph.
 The production target remains the single DBeaver `Directory` location above.
 Create a distinct test target that repeats that exact verified `Directory`
 location and adds one `type="Maven"` location with
-`includeDependencyDepth="infinite"`, `includeDependencyScopes="compile"`,
+`includeDependencyDepth="infinite"`, `includeDependencyScopes="compile,runtime"`,
 `includeSource="false"`, and `missingManifest="error"`. Its exact roots are:
 
 ```text
 org.junit.jupiter:junit-jupiter-api:5.13.4
 org.junit.jupiter:junit-jupiter-engine:5.13.4
 org.junit.platform:junit-platform-launcher:1.13.4
+org.junit.platform:junit-platform-suite-api:1.13.4
+org.junit.platform:junit-platform-suite-engine:1.13.4
 ```
 
 Every test module overrides `target-platform-configuration` to use only this
@@ -477,7 +479,7 @@ npm --prefix web run build
 
 Expected: every command exits zero; production resolves only the
 checksum-pinned DBeaver 26.1.0 installation, while test modules add only the
-exact Maven Central test bundles declared in the test target.
+exact Maven Central test bundles declared in the test target. The resolved runtime closure includes `junit-platform-suite-commons` 1.13.4; ADR 0011 records why the two exact Suite roots are required and test-only.
 
 - [ ] **Step 9: Add the smoke CI workflow**
 

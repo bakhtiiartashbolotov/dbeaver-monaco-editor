@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.github.bakhtiiartashbolotov</groupId>
+    <artifactId>dbeaver-monaco-editor</artifactId>
+    <version>${revision}</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+  <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.ui</artifactId>
+  <packaging>eclipse-plugin</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.bakhtiiartashbolotov</groupId>
+      <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.target</artifactId>
+      <version>${revision}</version>
+      <type>target</type>
+    </dependency>
+  </dependencies>
+</project>

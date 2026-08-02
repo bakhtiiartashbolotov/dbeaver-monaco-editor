@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.bakhtiiartashbolotov</groupId>
+  <artifactId>dbeaver-monaco-editor</artifactId>
+  <version>${revision}</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <revision>0.1.0-SNAPSHOT</revision>
+    <tycho.version>5.0.3</tycho.version>
+    <maven.compiler.release>21</maven.compiler.release>
+    <dbeaver.baseline.version>26.1.0</dbeaver.baseline.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <modules>
+    <module>releng/io.github.bakhtiiartashbolotov.dbeaver.monaco.target</module>
+    <module>releng/io.github.bakhtiiartashbolotov.dbeaver.monaco.test.target</module>
+    <module>bundles/io.github.bakhtiiartashbolotov.dbeaver.monaco.core</module>
+    <module>bundles/io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge</module>
+    <module>web</module>
+    <module>bundles/io.github.bakhtiiartashbolotov.dbeaver.monaco.ui</module>
+    <module>features/io.github.bakhtiiartashbolotov.dbeaver.monaco.feature</module>
+    <module>repository</module>
+    <module>tests/io.github.bakhtiiartashbolotov.dbeaver.monaco.core.tests</module>
+    <module>tests/io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge.tests</module>
+    <module>tests/io.github.bakhtiiartashbolotov.dbeaver.monaco.ui.tests</module>
+  </modules>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.eclipse.tycho</groupId>
+        <artifactId>tycho-maven-plugin</artifactId>
+        <version>${tycho.version}</version>
+        <extensions>true</extensions>
+      </plugin>
+      <plugin>
+        <groupId>org.eclipse.tycho</groupId>
+        <artifactId>target-platform-configuration</artifactId>
+        <version>${tycho.version}</version>
+        <configuration>
+          <target>
+            <artifact>
+              <groupId>io.github.bakhtiiartashbolotov</groupId>
+              <artifactId>io.github.bakhtiiartashbolotov.dbeaver.monaco.target</artifactId>
+              <version>${revision}</version>
+            </artifact>
+          </target>
+          <pomDependencies>ignore</pomDependencies>
+          <dependency-resolution>
+            <localArtifacts>ignore</localArtifacts>
+          </dependency-resolution>
+          <executionEnvironment>JavaSE-21</executionEnvironment>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.eclipse.tycho</groupId>
+        <artifactId>tycho-compiler-plugin</artifactId>
+        <version>${tycho.version}</version>
+        <configuration><release>21</release></configuration>
+      </plugin>
+      <plugin><groupId>org.eclipse.tycho</groupId><artifactId>tycho-packaging-plugin</artifactId><version>${tycho.version}</version></plugin>
+      <plugin><groupId>org.eclipse.tycho</groupId><artifactId>tycho-p2-repository-plugin</artifactId><version>${tycho.version}</version></plugin>
+      <plugin><groupId>org.eclipse.tycho</groupId><artifactId>tycho-p2-publisher-plugin</artifactId><version>${tycho.version}</version></plugin>
+    </plugins>
+  </build>
+</project>

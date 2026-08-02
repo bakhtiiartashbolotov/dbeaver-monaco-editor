@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feature
+    id="io.github.bakhtiiartashbolotov.dbeaver.monaco.feature"
+    label="DBeaver Monaco Editor"
+    version="0.1.0.qualifier"
+    provider-name="bakhtiiartashbolotov">
+  <description>Monaco presentation extension scaffold.</description>
+  <copyright>Copyright 2026.</copyright>
+  <license url="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</license>
+  <plugin id="io.github.bakhtiiartashbolotov.dbeaver.monaco.core" download-size="0" install-size="0" version="0.0.0" unpack="false"/>
+  <plugin id="io.github.bakhtiiartashbolotov.dbeaver.monaco.bridge" download-size="0" install-size="0" version="0.0.0" unpack="false"/>
+  <plugin id="io.github.bakhtiiartashbolotov.dbeaver.monaco.web" download-size="0" install-size="0" version="0.0.0" unpack="false"/>
+  <plugin id="io.github.bakhtiiartashbolotov.dbeaver.monaco.ui" download-size="0" install-size="0" version="0.0.0" unpack="false"/>
+</feature>

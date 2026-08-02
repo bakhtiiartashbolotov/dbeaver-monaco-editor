@@ -663,3 +663,11 @@ Known limitations or blockers. State “None” only when verified.
 ## Next
 The next plan task, but do not start it automatically.
 ```
+
+## 14. Public-link hygiene
+
+Do not place internal ChatGPT or Codex task, chat, conversation, session,
+workspace, or share URLs in public pull requests, issues, comments, commit
+messages, logs, artifacts, or repository documentation. Public links to normal
+official OpenAI product documentation are allowed. Use GitHub Issue, pull
+request, Actions-run URLs, and commit SHAs as public implementation evidence.
