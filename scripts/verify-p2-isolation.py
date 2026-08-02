@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import lzma
 from pathlib import Path
 import stat
@@ -19,7 +20,9 @@ BUNDLES = {
 }
 FEATURE = "io.github.bakhtiiartashbolotov.dbeaver.monaco.feature"
 TOP_LEVEL = {"artifacts.jar", "artifacts.xml.xz", "content.jar", "content.xml.xz", "p2.index", "features", "plugins"}
-TEST_MARKERS = (".tests", "junit", "surefire", "opentest4j", "apiguardian", "vintage")
+TEST_MARKERS = (".tests", "junit", "surefire", "opentest4j", "apiguardian", "vintage", "testng")
+REPOSITORY_NAME = "io.github.bakhtiiartashbolotov.dbeaver.monaco.repository"
+JRE_CAPABILITY_DIGEST = "e652aa1bceb4e97f3b0cf6b27afe490bcaf59fc965d6afd83249aa8ebac4057c"
 
 
 def fail(message: str) -> None:
@@ -38,9 +41,29 @@ def closed_jars(directory: Path, label: str) -> list[Path]:
     return sorted(jars)
 
 
+def archive_has_test_payload(archive: zipfile.ZipFile, label: str, depth: int = 0) -> None:
+    if depth > 2 or len(archive.infolist()) > 10000:
+        fail(f"archive inspection bound exceeded: {label}")
+    for entry in archive.infolist():
+        normalized = entry.filename.replace("\\", "/").lower()
+        if any(marker in normalized for marker in TEST_MARKERS):
+            fail(f"test/JUnit marker in production bundle payload or manifest: {label}")
+        if not entry.is_dir() and normalized.endswith((".jar", ".zip")):
+            data = archive.read(entry)
+            if len(data) > 64 * 1024 * 1024:
+                fail(f"nested archive inspection bound exceeded: {label}:{entry.filename}")
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as nested:
+                    archive_has_test_payload(nested, f"{label}:{entry.filename}", depth + 1)
+            except zipfile.BadZipFile as error:
+                fail(f"unreadable nested archive: {label}:{entry.filename}: {error}")
+            fail(f"nested archive is forbidden in production scaffold: {label}:{entry.filename}")
+
+
 def manifest_identity(bundle: Path) -> tuple[str, str]:
     try:
         with zipfile.ZipFile(bundle) as archive:
+            archive_has_test_payload(archive, bundle.name)
             text = archive.read("META-INF/MANIFEST.MF").decode("utf-8")
             payload_names = archive.namelist()
     except (KeyError, UnicodeDecodeError, zipfile.BadZipFile) as error:
@@ -117,9 +140,9 @@ def validate_properties_container(element: ET.Element, label: str) -> dict[str, 
 
 def validate_sized_children(element: ET.Element, child_tags: set[str], label: str) -> list[ET.Element]:
     children = list(element)
-    require_size(element, children, label)
     if any(child.tag not in child_tags for child in children):
         fail(f"unexpected {label} child")
+    require_size(element, children, label)
     return children
 
 
@@ -200,8 +223,7 @@ def exact_artifact_reference(unit: ET.Element, expected: tuple[str, str, str] | 
         return
     if len(containers) != 1:
         fail(f"missing artifact reference on {label}")
-    refs = containers[0].findall("artifact")
-    require_size(containers[0], refs, f"{label} artifacts")
+    refs = validate_sized_children(containers[0], {"artifact"}, f"{label} artifacts")
     actual = [(item.attrib.get("classifier"), item.attrib.get("id"), item.attrib.get("version")) for item in refs]
     if (actual != [expected] or any(set(item.attrib) != {"classifier", "id", "version"}
                                     or list(item) for item in refs)):
@@ -249,6 +271,7 @@ def exact_requirements(unit: ET.Element, expected: set[tuple[tuple[str, str], ..
             structure_ok = False
         if expected_filter is not None:
             structure_ok = (structure_ok and len(children) == 1 and children[0].tag == "filter"
+                            and not children[0].attrib
                             and (children[0].text or "").strip() == expected_filter
                             and not list(children[0]))
         elif children:
@@ -288,12 +311,14 @@ def main() -> None:
     content = ET.fromstring(metadata_bytes(repository, "content"))
     if (artifacts.tag != "repository"
             or set(artifacts.attrib) != {"name", "type", "version"}
+            or artifacts.attrib.get("name") != REPOSITORY_NAME
             or artifacts.attrib.get("type") != "org.eclipse.equinox.p2.artifact.repository.simpleRepository"
             or artifacts.attrib.get("version") != "1"
             or len(artifacts.findall("artifacts")) != 1):
         fail("invalid artifacts metadata root or container structure")
     if (content.tag != "repository"
             or set(content.attrib) != {"name", "type", "version"}
+            or content.attrib.get("name") != REPOSITORY_NAME
             or content.attrib.get("type") != "org.eclipse.equinox.internal.p2.metadata.repository.LocalMetadataRepository"
             or content.attrib.get("version") != "1"
             or len(content.findall("units")) != 1):
@@ -307,8 +332,13 @@ def main() -> None:
     unit_container = content.find("units")
     assert artifact_properties is not None and mappings is not None and artifact_container is not None
     assert content_properties is not None and unit_container is not None
-    validate_properties_container(artifact_properties, "repository artifact")
-    validate_properties_container(content_properties, "repository content")
+    artifact_repository_properties = validate_properties_container(artifact_properties, "repository artifact")
+    content_repository_properties = validate_properties_container(content_properties, "repository content")
+    for label, values in (("artifact", artifact_repository_properties),
+                          ("content", content_repository_properties)):
+        if (set(values) != {"p2.timestamp", "p2.compressed"}
+                or not values["p2.timestamp"].isdigit() or values["p2.compressed"] != "true"):
+            fail(f"invalid repository {label} property values")
     mapping_rules = mappings.findall("rule")
     require_size(mappings, mapping_rules, "mappings")
     expected_mappings = [
@@ -344,6 +374,17 @@ def main() -> None:
         fail("test/JUnit marker in packaged feature payload or metadata")
     if feature_members != ["META-INF/", "META-INF/MANIFEST.MF", "feature.xml"]:
         fail(f"unexpected packaged feature members: {feature_members}")
+    feature_manifest_lines = []
+    for line in feature_payloads["META-INF/MANIFEST.MF"].decode("utf-8").replace("\r\n", "\n").splitlines():
+        if line.startswith(" ") and feature_manifest_lines:
+            feature_manifest_lines[-1] += line[1:]
+        elif line:
+            feature_manifest_lines.append(line)
+    feature_manifest = dict(line.split(":", 1) for line in feature_manifest_lines if ":" in line)
+    feature_manifest = {name: value.strip() for name, value in feature_manifest.items()}
+    if feature_manifest != {"Manifest-Version": "1.0", "Created-By": "Maven Archiver 3.6.6",
+                            "Build-Jdk-Spec": "21", "Java-Version": "21"}:
+        fail(f"invalid packaged feature Java/build manifest: {feature_manifest}")
     allowed_feature_children = ["description", "copyright", "license", "plugin", "plugin", "plugin", "plugin"]
     if feature_xml.tag != "feature" or feature_xml.attrib.get("id") != FEATURE:
         fail("invalid packaged feature root or ID")
@@ -363,8 +404,7 @@ def main() -> None:
     if not feature_version:
         fail("packaged feature version is empty")
 
-    artifact_elements = artifacts.findall("./artifacts/artifact")
-    require_size(artifact_container, artifact_elements, "artifacts")
+    artifact_elements = validate_sized_children(artifact_container, {"artifact"}, "artifacts")
     artifact_roles = [(item.attrib.get("classifier", ""), item.attrib.get("id", ""), item.attrib.get("version", ""))
                       for item in artifact_elements]
     expected_artifact_roles = {("osgi.bundle", name, version) for name, version in identities}
@@ -390,6 +430,14 @@ def main() -> None:
             expected_property_names.add("download.contentType")
         if set(props) != expected_property_names:
             fail(f"unexpected artifact properties: {identifier}")
+        expected_type = "eclipse-plugin" if classifier == "osgi.bundle" else "eclipse-feature"
+        if (props["maven-groupId"] != "io.github.bakhtiiartashbolotov"
+                or props["maven-artifactId"] != identifier
+                or props["maven-version"] != "0.1.0-SNAPSHOT"
+                or props["maven-type"] != expected_type
+                or (classifier == "org.eclipse.update.feature"
+                    and props["download.contentType"] != "application/zip")):
+            fail(f"invalid artifact Maven/property values: {identifier}")
         if props.get("artifact.size") != str(len(data)) or props.get("download.size") != str(len(data)):
             fail(f"incorrect declared artifact size: {identifier}")
         if props.get("download.checksum.sha-256") != hashlib.sha256(data).hexdigest():
@@ -397,8 +445,7 @@ def main() -> None:
         if props.get("download.checksum.sha-512") != hashlib.sha512(data).hexdigest():
             fail(f"incorrect SHA-512: {identifier}")
 
-    units = content.findall("./units/unit")
-    require_size(unit_container, units, "units")
+    units = validate_sized_children(unit_container, {"unit"}, "units")
     unit_map = {unit.attrib.get("id", ""): unit for unit in units}
     if len(units) != 8 or len(unit_map) != 8:
         fail(f"expected exactly eight unique IUs, found {len(units)}")
@@ -420,6 +467,19 @@ def main() -> None:
     if len(categories) != 1:
         fail(f"expected exactly one category IU, found {len(categories)}")
     category = categories[0]
+    try:
+        category_source = ET.parse("repository/category.xml").getroot()
+    except (OSError, ET.ParseError) as error:
+        fail(f"unreadable canonical category.xml: {error}")
+    category_defs = category_source.findall("category-def")
+    source_features = category_source.findall("feature")
+    if (category_source.tag != "site" or category_source.attrib or len(category_defs) != 1
+            or len(source_features) != 1 or category_defs[0].attrib != {
+                "name": "dbeaver-monaco", "label": "DBeaver Monaco Editor"}
+            or source_features[0].attrib != {"id": FEATURE, "version": "0.0.0"}
+            or len(source_features[0]) != 1 or source_features[0][0].tag != "category"
+            or source_features[0][0].attrib != {"name": "dbeaver-monaco"}):
+        fail("invalid canonical category.xml relationship")
     if set(unit_map) != expected_ids | {category.attrib["id"]}:
         fail(f"unexpected IU universe: {sorted(set(unit_map) ^ (expected_ids | {category.attrib['id']}))}")
     if unit_map["a.jre.javase"].attrib.get("version") != "21.0.0":
@@ -511,6 +571,15 @@ def main() -> None:
             "org.eclipse.equinox.p2.provider", "maven-groupId", "maven-artifactId", "maven-version",
             "maven-type"}:
         fail("unexpected feature.jar properties")
+    if (feature_jar_properties["org.eclipse.equinox.p2.name"] != "DBeaver Monaco Editor"
+            or feature_jar_properties["org.eclipse.equinox.p2.description"]
+            != "Monaco presentation extension scaffold."
+            or feature_jar_properties["org.eclipse.equinox.p2.provider"] != "bakhtiiartashbolotov"
+            or feature_jar_properties["maven-groupId"] != "io.github.bakhtiiartashbolotov"
+            or feature_jar_properties["maven-artifactId"] != FEATURE
+            or feature_jar_properties["maven-version"] != "0.1.0-SNAPSHOT"
+            or feature_jar_properties["maven-type"] != "eclipse-feature"):
+        fail("invalid feature.jar property values")
     feature_filter = feature_jar.find("filter")
     if (feature_filter is None or feature_filter.attrib or list(feature_filter)
             or (feature_filter.text or "").strip() != "(org.eclipse.update.install.features=true)"):
@@ -524,6 +593,8 @@ def main() -> None:
     if feature_data is None:
         fail("missing feature.jar touchpoint data")
     instruction_groups = validate_sized_children(feature_data, {"instructions"}, "feature.jar touchpointData")
+    if len(instruction_groups) != 1:
+        fail("invalid feature.jar touchpointData")
     instructions = validate_sized_children(instruction_groups[0], {"instruction"}, "feature.jar instructions")
     if (len(instructions) != 1 or instructions[0].attrib != {"key": "zipped"}
             or list(instructions[0]) or (instructions[0].text or "").strip() != "true"):
@@ -548,6 +619,15 @@ def main() -> None:
             "org.eclipse.equinox.p2.provider", "org.eclipse.equinox.p2.type.group", "maven-groupId",
             "maven-artifactId", "maven-version", "maven-type"}:
         fail("missing or invalid feature.group role property")
+    if (group_properties["org.eclipse.equinox.p2.name"] != "DBeaver Monaco Editor"
+            or group_properties["org.eclipse.equinox.p2.description"]
+            != "Monaco presentation extension scaffold."
+            or group_properties["org.eclipse.equinox.p2.provider"] != "bakhtiiartashbolotov"
+            or group_properties["maven-groupId"] != "io.github.bakhtiiartashbolotov"
+            or group_properties["maven-artifactId"] != FEATURE
+            or group_properties["maven-version"] != "0.1.0-SNAPSHOT"
+            or group_properties["maven-type"] != "eclipse-feature"):
+        fail("invalid feature.group property values")
     group_update = group.find("update")
     if group_update is None or group_update.attrib != {
             "id": feature_group_id, "range": f"[0.0.0,{feature_version})", "severity": "0"} \
@@ -575,6 +655,9 @@ def main() -> None:
     if category_properties.get("org.eclipse.equinox.p2.type.category") != "true" or set(category_properties) != {
             "org.eclipse.equinox.p2.name", "org.eclipse.equinox.p2.type.category"}:
         fail("invalid category properties")
+    if (category_properties["org.eclipse.equinox.p2.name"] != category_defs[0].attrib["label"]
+            or not category_id.endswith(f".{category_defs[0].attrib['name']}")):
+        fail("invalid generated category relationship")
     validate_provides(category, {("org.eclipse.equinox.p2.iu", category_id, category_version)}, "category")
     exact_capability(category, ("org.eclipse.equinox.p2.iu", category_id, category_version), "category self")
     category_edge = {tuple(sorted({"namespace": "org.eclipse.equinox.p2.iu", "name": feature_group_id,
@@ -594,6 +677,10 @@ def main() -> None:
     if len(jre_caps) != 260 or any(set(item.attrib) != {"namespace", "name", "version"} or list(item)
                                    for item in jre_caps):
         fail("invalid Java capability universe")
+    normalized_jre = sorted("\0".join((item.attrib["namespace"], item.attrib["name"], item.attrib["version"]))
+                            for item in jre_caps)
+    if hashlib.sha256("\n".join(normalized_jre).encode()).hexdigest() != JRE_CAPABILITY_DIGEST:
+        fail("invalid Java capability universe digest")
     jre_touchpoint = jre.find("touchpoint")
     if jre_touchpoint is None or jre_touchpoint.attrib != {
             "id": "org.eclipse.equinox.p2.native", "version": "1.0.0"} or list(jre_touchpoint):

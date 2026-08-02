@@ -12,6 +12,7 @@ had_cache=false
 cleanup_done=false
 tracked_saved=false
 cache_saved=false
+working_cache_created=false
 
 cleanup() {
   local status=$?
@@ -19,15 +20,20 @@ cleanup() {
     return "$status"
   fi
   cleanup_done=true
-  trap - EXIT INT TERM HUP
+  trap - EXIT
+  trap '' INT TERM HUP
   if [[ "$foreign_lock_owned" == true && -n "$foreign_lock" ]]; then
     rm -rf "$foreign_lock" 2>/dev/null || true
   fi
-  if [[ "$cache_saved" == true ]]; then
-    rm -rf .cache 2>/dev/null || true
-    if [[ "$had_cache" == true && ( -e "$suite_cache_backup" || -L "$suite_cache_backup" ) ]]; then
+  if [[ "$had_cache" == true && ( -e "$suite_cache_backup" || -L "$suite_cache_backup" ) ]]; then
+    if [[ -e .cache || -L .cache ]]; then
+      rm -rf .cache 2>/dev/null || true
+    fi
+    if [[ -e "$suite_cache_backup" || -L "$suite_cache_backup" ]]; then
       mv "$suite_cache_backup" .cache
     fi
+  elif [[ "$had_cache" == false && "$working_cache_created" == true ]]; then
+    rm -rf .cache 2>/dev/null || true
   fi
   if [[ "$tracked_saved" == true ]]; then
     for tracked in mvnw .mvn/wrapper/maven-wrapper.properties \
@@ -68,11 +74,11 @@ if source.exists() and all(not part.is_symlink() for part in (Path(".cache"), so
         if digest == expected:
             shutil.copyfile(source, sys.argv[1])
 PY
-  cache_saved=true
   mv .cache "$suite_cache_backup"
 fi
 cache_saved=true
 mkdir .cache
+working_cache_created=true
 if [[ -f "$cache_archive_seed" ]]; then
   mkdir .cache/downloads
   cp "$cache_archive_seed" .cache/downloads/dbeaver-ce-26.1.0-linux-x86_64.tar.gz
@@ -84,7 +90,7 @@ if [[ ${TASK1_GUARD_TEST_FAIL_SETUP:-0} == 1 ]]; then
 fi
 
 if [[ ${1:-} == --transaction-self-test-child || ${1:-} == --transaction-signal-child \
-    || ${1:-} == --transaction-owned-lock-child ]]; then
+    || ${1:-} == --transaction-owned-lock-child || ${1:-} == --transaction-lock-race-child ]]; then
   printf 'transaction mutation reached\n' >&2
   chmod 0600 mvnw
   printf '\nmutated\n' >> .mvn/wrapper/maven-wrapper.properties
@@ -97,9 +103,19 @@ if [[ ${1:-} == --transaction-self-test-child || ${1:-} == --transaction-signal-
     kill -TERM $$
   elif [[ ${1:-} == --transaction-owned-lock-child ]]; then
     foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
-    foreign_lock_owned=true
     mkdir "$foreign_lock"
+    foreign_lock_owned=true
     printf 'owned\n' > "$foreign_lock/owner"
+  elif [[ ${1:-} == --transaction-lock-race-child ]]; then
+    foreign_lock=.cache/.prepare-dbeaver-26.1.0.lock
+    mkdir "$foreign_lock"
+    printf 'foreign\n' > "$foreign_lock/owner"
+    if mkdir "$foreign_lock" 2>/dev/null; then
+      foreign_lock_owned=true
+      echo 'lock race unexpectedly acquired' >&2
+      exit 1
+    fi
+    printf 'foreign lock race preserved\n' >&2
   fi
   exit 73
 elif [[ $# -ne 0 ]]; then
@@ -171,6 +187,8 @@ assert_forced_restore setup-failure 74 'forced setup failure' \
   env TASK1_GUARD_TEST_FAIL_SETUP=1 bash scripts/test-task1-guards.sh
 assert_forced_restore owned-lock-cleanup 73 'transaction mutation reached' \
   bash scripts/test-task1-guards.sh --transaction-owned-lock-child
+assert_forced_restore foreign-lock-race 73 'foreign lock race preserved' \
+  bash scripts/test-task1-guards.sh --transaction-lock-race-child
 
 mkdir -p "$temporary/mv-wrapper"
 real_mv=$(command -v mv)
@@ -187,6 +205,49 @@ assert_forced_restore post-move-signal 143 '' \
   env PATH="$temporary/mv-wrapper:$PATH" bash scripts/test-task1-guards.sh --transaction-self-test-child
 test "$(cat "$temporary/post-move.reached")" = 'post-move reached'
 
+mkdir -p "$temporary/mv-fail-wrapper"
+cat > "$temporary/mv-fail-wrapper/mv" <<EOF
+#!/usr/bin/env bash
+if [[ \${1:-} == .cache ]]; then
+  printf 'pre-move failure reached\n' >&2
+  exit 75
+fi
+exec "$real_mv" "\$@"
+EOF
+chmod +x "$temporary/mv-fail-wrapper/mv"
+assert_forced_restore pre-move-failure 75 'pre-move failure reached' \
+  env PATH="$temporary/mv-fail-wrapper:$PATH" bash scripts/test-task1-guards.sh --transaction-self-test-child
+
+mkdir -p "$temporary/mv-pre-signal-wrapper"
+cat > "$temporary/mv-pre-signal-wrapper/mv" <<EOF
+#!/usr/bin/env bash
+if [[ \${1:-} == .cache ]]; then
+  printf 'pre-move signal reached\n' >&2
+  kill -TERM "\$PPID"
+  exit 76
+fi
+exec "$real_mv" "\$@"
+EOF
+chmod +x "$temporary/mv-pre-signal-wrapper/mv"
+assert_forced_restore pre-move-signal 143 'pre-move signal reached' \
+  env PATH="$temporary/mv-pre-signal-wrapper:$PATH" bash scripts/test-task1-guards.sh --transaction-self-test-child
+
+mkdir -p "$temporary/rm-cleanup-signal-wrapper"
+real_rm=$(command -v rm)
+cat > "$temporary/rm-cleanup-signal-wrapper/rm" <<EOF
+#!/usr/bin/env bash
+"$real_rm" "\$@"
+if [[ " \$* " == *' .cache '* && ! -e "$temporary/cleanup-signal.reached" ]]; then
+  printf 'cleanup signal reached\n' > "$temporary/cleanup-signal.reached"
+  kill -TERM "\$PPID"
+fi
+EOF
+chmod +x "$temporary/rm-cleanup-signal-wrapper/rm"
+assert_forced_restore cleanup-second-signal 73 'transaction mutation reached' \
+  env PATH="$temporary/rm-cleanup-signal-wrapper:$PATH" bash scripts/test-task1-guards.sh \
+    --transaction-self-test-child
+test "$(cat "$temporary/cleanup-signal.reached")" = 'cleanup signal reached'
+
 rm -rf .cache
 assert_forced_restore absent-cache 73 'transaction mutation reached' \
   bash scripts/test-task1-guards.sh --transaction-self-test-child
@@ -196,10 +257,16 @@ mkdir .cache
 rm -rf .cache
 mkdir -p "$temporary/outside-valid"
 printf 'outside sentinel\n' > "$temporary/outside-valid/sentinel"
+mkdir "$temporary/outside-valid/nested"
+printf 'second outside value\n' > "$temporary/outside-valid/nested/value"
 ln -s "$temporary/outside-valid" .cache
+find "$temporary/outside-valid" -printf '%y %m %s %p %l\n' -exec sha256sum {} \; 2>/dev/null | sha256sum \
+  > "$temporary/root-valid.before"
 assert_forced_restore valid-cache-symlink 73 'transaction mutation reached' \
   bash scripts/test-task1-guards.sh --transaction-self-test-child
-test "$(cat "$temporary/outside-valid/sentinel")" = 'outside sentinel'
+find "$temporary/outside-valid" -printf '%y %m %s %p %l\n' -exec sha256sum {} \; 2>/dev/null | sha256sum \
+  > "$temporary/root-valid.after"
+diff -u "$temporary/root-valid.before" "$temporary/root-valid.after"
 rm .cache
 ln -s "$temporary/missing-cache-target" .cache
 assert_forced_restore broken-cache-symlink 73 'transaction mutation reached' \
@@ -739,7 +806,10 @@ for mutation in xz-test-iu xz-test-artifact jar-divergence index-order index-sym
   required-properties-extra required-properties-remove requires-size provides-size \
   extra-feature-capability artifact-ref-attribute artifact-properties-size feature-junit-payload \
   bundle-require-capability feature-plugin-attribute feature-root feature-import feature-include \
-  feature-require unexpected-top-level; do
+  feature-require unknown-artifact-child unknown-unit-child unknown-iu-artifact-child filter-attribute \
+  touchpoint-groups artifact-maven-value jre-capability-drift repository-name repository-property \
+  feature-property-value group-property-value nested-junit-payload direct-testng-payload \
+  feature-manifest-java unexpected-top-level; do
   cp -a "$repository" "$temporary/closed-p2-$mutation"
   python3 - "$temporary/closed-p2-$mutation" "$mutation" <<'PY'
 import lzma
@@ -996,6 +1066,102 @@ elif mutation == "feature-plugin-attribute":
         values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
         values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
     both("artifacts", update_feature_plugin_hashes)
+elif mutation == "unknown-artifact-child":
+    both("artifacts", lambda root: ET.SubElement(root.find("artifacts"), "unknown"))
+elif mutation == "unknown-unit-child":
+    both("content", lambda root: ET.SubElement(root.find("units"), "unknown"))
+elif mutation == "unknown-iu-artifact-child":
+    def unknown_iu_artifact(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        ET.SubElement(unit.find("artifacts"), "unknown")
+    both("content", unknown_iu_artifact)
+elif mutation == "filter-attribute":
+    def filter_attribute(root):
+        group = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.group"))
+        group.find("./requires/required/filter").set("unknown", "true")
+    both("content", filter_attribute)
+elif mutation == "touchpoint-groups":
+    def duplicate_instructions(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        data = unit.find("touchpointData")
+        import copy
+        data.append(copy.deepcopy(data.find("instructions")))
+        data.set("size", "2")
+    both("content", duplicate_instructions)
+elif mutation == "artifact-maven-value":
+    both("artifacts", lambda root: root.find(
+        "./artifacts/artifact/properties/property[@name='maven-artifactId']").set("value", "wrong"))
+elif mutation == "jre-capability-drift":
+    def drift_jre(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib.get("id") == "a.jre.javase")
+        capability = unit.findall("./provides/provided")[1]
+        capability.set("name", "java.changed")
+    both("content", drift_jre)
+elif mutation == "repository-name":
+    both("content", lambda root: root.set("name", "wrong.repository"))
+elif mutation == "repository-property":
+    both("artifacts", lambda root: root.find(
+        "./properties/property[@name='p2.compressed']").set("value", "false"))
+elif mutation == "feature-property-value":
+    def feature_property_value(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.jar"))
+        unit.find("./properties/property[@name='maven-artifactId']").set("value", "wrong")
+    both("content", feature_property_value)
+elif mutation == "group-property-value":
+    def group_property_value(root):
+        unit = next(unit for unit in root.findall("./units/unit") if unit.attrib["id"].endswith("feature.group"))
+        unit.find("./properties/property[@name='maven-type']").set("value", "wrong")
+    both("content", group_property_value)
+elif mutation in {"nested-junit-payload", "direct-testng-payload"}:
+    import hashlib
+    import io
+    plugin = next((repo / "plugins").glob("*core*.jar"))
+    with zipfile.ZipFile(plugin) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    if mutation == "nested-junit-payload":
+        nested_bytes = io.BytesIO()
+        with zipfile.ZipFile(nested_bytes, "w") as nested:
+            nested.writestr("org/junit/JupiterInjected.class", b"injected")
+        files["lib/runtime.jar"] = nested_bytes.getvalue()
+        manifest = files["META-INF/MANIFEST.MF"].decode("utf-8")
+        files["META-INF/MANIFEST.MF"] = (manifest.rstrip() + "\nBundle-ClassPath: .,lib/runtime.jar\n").encode()
+    else:
+        files["org/testng/TestNG.class"] = b"injected"
+    temporary = plugin.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, plugin)
+    def update_nested_hashes(root):
+        artifact = next(item for item in root.findall("./artifacts/artifact")
+                        if item.attrib.get("classifier") == "osgi.bundle" and item.attrib.get("id") in plugin.name)
+        values = {item.attrib["name"]: item for item in artifact.findall("./properties/property")}
+        data = plugin.read_bytes()
+        values["artifact.size"].set("value", str(len(data)))
+        values["download.size"].set("value", str(len(data)))
+        values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
+        values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
+    both("artifacts", update_nested_hashes)
+elif mutation == "feature-manifest-java":
+    import hashlib
+    feature = next((repo / "features").glob("*.jar"))
+    with zipfile.ZipFile(feature) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    files["META-INF/MANIFEST.MF"] = files["META-INF/MANIFEST.MF"].replace(b"Java-Version: 21", b"Java-Version: 17")
+    temporary = feature.with_suffix(".tmp")
+    with zipfile.ZipFile(temporary, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(temporary, feature)
+    def update_feature_manifest_hashes(root):
+        artifact = root.find("./artifacts/artifact[@classifier='org.eclipse.update.feature']")
+        values = {item.attrib["name"]: item for item in artifact.findall("./properties/property")}
+        data = feature.read_bytes()
+        values["artifact.size"].set("value", str(len(data)))
+        values["download.size"].set("value", str(len(data)))
+        values["download.checksum.sha-256"].set("value", hashlib.sha256(data).hexdigest())
+        values["download.checksum.sha-512"].set("value", hashlib.sha512(data).hexdigest())
+    both("artifacts", update_feature_manifest_hashes)
 elif mutation == "feature-root":
     feature = next((repo / "features").glob("*.jar"))
     with zipfile.ZipFile(feature) as archive:
@@ -1060,6 +1226,24 @@ PY
     bundle-require-capability) rg -q 'test/JUnit marker in production bundle payload or manifest' \
       "$temporary/closed-p2-$mutation.out" ;;
     feature-plugin-attribute) rg -q 'packaged feature plugin identities or structure differ' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    unknown-artifact-child) rg -q 'unexpected artifacts child' "$temporary/closed-p2-$mutation.out" ;;
+    unknown-unit-child) rg -q 'unexpected units child' "$temporary/closed-p2-$mutation.out" ;;
+    unknown-iu-artifact-child) rg -q 'unexpected feature.jar artifacts child' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    filter-attribute) rg -q 'unexpected feature.group requirements' "$temporary/closed-p2-$mutation.out" ;;
+    touchpoint-groups) rg -q 'invalid feature.jar touchpointData' "$temporary/closed-p2-$mutation.out" ;;
+    artifact-maven-value) rg -q 'invalid artifact Maven/property values' "$temporary/closed-p2-$mutation.out" ;;
+    jre-capability-drift) rg -q 'invalid Java capability universe' "$temporary/closed-p2-$mutation.out" ;;
+    repository-name) rg -q 'invalid content metadata root or container structure' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    repository-property) rg -q 'invalid repository artifact property values' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    feature-property-value) rg -q 'invalid feature.jar property values' "$temporary/closed-p2-$mutation.out" ;;
+    group-property-value) rg -q 'invalid feature.group property values' "$temporary/closed-p2-$mutation.out" ;;
+    nested-junit-payload|direct-testng-payload) rg -q 'test/JUnit marker in production bundle payload' \
+      "$temporary/closed-p2-$mutation.out" ;;
+    feature-manifest-java) rg -q 'invalid packaged feature Java/build manifest' \
       "$temporary/closed-p2-$mutation.out" ;;
   esac
 done
